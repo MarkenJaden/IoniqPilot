@@ -363,7 +363,10 @@ class TransportPauseFeedback:
     # Ford angle/curvature: intent-only LONG echo join.
     # Require fresh LAT and all health/fault checks.
     ford_long = bool(ford_qualified(cp, marked_only=True) and cp.openpilotLongitudinalControl)
-    early_long = gm or cp.brand == 'hyundai' and early_native_long_withdrawal_supported(cp) or ev9 or ford_withdrawal or ford_long
+    from opendbc.car.volkswagen.long_aol import qualified as volkswagen_long_qualified
+    volkswagen_withdrawal = bool(volkswagen_long_qualified(cp, marked_only=True) and cs.cruiseState.available and
+      (physical_cancel(cs, cp) or not axis.desiredLongitudinal and not axis.longitudinalActive))
+    early_long = gm or cp.brand == 'hyundai' and early_native_long_withdrawal_supported(cp) or ev9 or ford_withdrawal or ford_long or volkswagen_withdrawal
     from openpilot.starpilot.car.gm.aol import f1_conventional_lateral_owner, gm_physical_pedal_withdrawal
     gm_pedal = gm_physical_pedal_withdrawal(cp, cs) and not f1_conventional_lateral_owner(cp)
     classic_brake = classic_brake_withdrawal(cp, cs)
@@ -385,13 +388,14 @@ class TransportPauseFeedback:
       not 0 < self.lateral_source_ns <= axis.sourceCarStateMonoTime <= axis.observedMonoTime <= now_ns or
       now_ns - axis.sourceCarStateMonoTime > AXIS_MAX_AGE_NS or
       not cs.canValid or cs.canTimeout or cs.steerFaultTemporary or cs.steerFaultPermanent or cs.accFaulted or
-      cs.steeringDisengage or physical_cancel(cs, cp) and not ford_withdrawal or
+      cs.steeringDisengage or physical_cancel(cs, cp) and not (ford_withdrawal or volkswagen_withdrawal) or
       not sm.seen['onroadEvents'] or not sm.valid['onroadEvents'] or not sm.alive['onroadEvents'] or
       not 0 < int(sm.logMonoTime['onroadEvents']) <= now_ns or
       now_ns - int(sm.logMonoTime['onroadEvents']) > 1_500_000_000 or
       any(event.immediateDisable or event.softDisable or
           event.userDisable and not (ev9_main_off and event.name == log.OnroadEvent.EventName.wrongCarMode or
             (gm_pedal or classic_brake) and event.name == log.OnroadEvent.EventName.pedalPressed or
+            volkswagen_withdrawal and event.name in (log.OnroadEvent.EventName.buttonCancel, log.OnroadEvent.EventName.pcmDisable) or
             ford_withdrawal and event.name in (log.OnroadEvent.EventName.pedalPressed, log.OnroadEvent.EventName.pcmDisable,
               log.OnroadEvent.EventName.buttonCancel))
           for event in sm['onroadEvents'])):
@@ -1388,6 +1392,11 @@ class TransportPauseFeedback:
         cp_identity(cp) == self.cp)
       continuity = bool(not self.session or axis.sessionId == self.session and
         (axis.sequence > self.sequence or axis.sequence == self.sequence and signature == self.signature))
+      if not current and continuity and cp.brand == 'subaru':
+        from openpilot.starpilot.car.subaru.aol import retain_stopped_intent
+        if retain_stopped_intent(self, sm, cp, cs, axis, now_ns, latched=latched,
+            producer=intent_producer_session, signature=signature):
+          return False
       if not current and continuity and self._inactive_gear_source_gap(sm, cp, cs, axis, stamp, now_ns, latched=latched,
           producer=intent_producer_session):
         return False
@@ -1507,6 +1516,12 @@ class TransportPauseFeedback:
           return True
       if current and continuity and self._angle_stop_intent_current(sm, cp, cs, axis, stamp, now_ns,
           latched=latched, producer=intent_producer_session):
+        previous = self.signature
+        if (cp.brand == 'hyundai' and not axis.lateralActive and previous is not None and
+            previous[9] and previous[11] and previous[13] and
+            0 < previous[8] <= previous[2] <= now_ns <= previous[4] and
+            now_ns - previous[8] <= AXIS_MAX_AGE_NS):
+          self.hkg_eps_join_until_ns = min(previous[4], self.lateral_source_ns + AXIS_MAX_AGE_NS)
         self.sequence, self.signature = int(axis.sequence), signature
         return False
       if current and continuity and (reason == 'critical' or self.lag_withdrawal_ns and not axis.lateralActive or

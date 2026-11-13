@@ -42,10 +42,10 @@ from openpilot.starpilot.ui.vasm_owner import ANNOTATION as VASM_ANNOTATION, RES
 PAGES = frozenset(("hub", "localization", "developer", "vehicle", "slc", "lane", "lane_change", "profiles", "personalities",
                    "traffic", "aggressive", "standard", "relaxed",
                    "curve", "torque", "tuning", "torque/bluepilot", "aol", "wheel", "appearance", "display", "data", "power", "sounds", "pip", "sentry", "vasm",
-                   "conditional", "conditional/cem", "conditional/ccm",
+                   "conditional", "conditional/cem",
                    *(f"{name}/{category}" for name in ("traffic", "aggressive", "standard", "relaxed")
                      for category in ("acceleration", "braking", "following"))))
-CONFIRM_ACTIONS = FEATURE_CONFIRM_ACTIONS | {DRIVER_MONITORING_RESET, CALIBRATION_RESET}
+CONFIRM_ACTIONS = (FEATURE_CONFIRM_ACTIONS - {SETUP_ACTION}) | {DRIVER_MONITORING_RESET, CALIBRATION_RESET}
 MAX_VIEWS = 64
 MAX_INTENTS = 64
 TTL = 60.0
