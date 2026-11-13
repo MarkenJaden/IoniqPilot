@@ -306,6 +306,14 @@ class Car:
       self.RI = interfaces[self.CI.CP.carFingerprint].RadarInterface(self.CI.CP)
       self.CP = self.CI.CP
 
+      if getattr(self.CP, 'brand', None) == 'hyundai' and not self.CP.notCar:
+        try:
+          from openpilot.starpilot.ioniq.runtime import maybe_run_startup_diagnostic
+          maybe_run_startup_diagnostic(self.can_callbacks[0], self.can_callbacks[1], obd_callback(self.params),
+                                       brand=self.CP.brand)
+        except Exception:
+          cloudlog.exception('Failed to run Ioniq startup diagnostic window')
+
       # continue onto next fingerprinting step in pandad
       self.params.put_bool("FirmwareQueryDone", True, block=True)
     else:

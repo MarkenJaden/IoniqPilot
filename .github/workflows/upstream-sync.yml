@@ -1,0 +1,54 @@
+name: Upstream Sync (StarPilotHQ/StarPilot -> IoniqPilot)
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Validate merge and checks without pushing or opening PRs/issues'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: write
+
+jobs:
+  sync:
+    uses: MarkenJaden/workflows/.github/workflows/upstream-sync.yml@main
+    with:
+      upstream_repo: 'StarPilotHQ/StarPilot'
+      upstream_branch: 'Dom'
+      target_branch: 'Dom'
+      python_version: '3.12'
+      submodules: 'false'
+      workflow_sync_policy: 'preserve_if_no_pat'
+      dry_run: ${{ inputs.dry_run || false }}
+      preflight_command: >
+        python3 -m py_compile
+        openpilot/starpilot/ioniq/__init__.py
+        openpilot/starpilot/ioniq/storage.py
+        openpilot/starpilot/ioniq/can_signals.py
+        openpilot/starpilot/ioniq/dtc_catalog.py
+        openpilot/starpilot/ioniq/uds_dtc.py
+        openpilot/starpilot/ioniq/recorder.py
+        openpilot/starpilot/ioniq/button_learner.py
+        openpilot/starpilot/ioniq/fuel_tracker.py
+        openpilot/starpilot/ioniq/runtime.py
+        openpilot/starpilot/galaxy/ioniq_tools.py
+        openpilot/starpilot/galaxy/server.py
+        openpilot/starpilot/galaxy/http_server.py
+        openpilot/system/manager/process_config.py
+        openpilot/selfdrive/car/card.py &&
+        (! command -v node >/dev/null || node --test
+        openpilot/starpilot/galaxy/tests/test_ioniq_tools.mjs
+        openpilot/starpilot/galaxy/tests/test_ui_templates.mjs
+        openpilot/starpilot/galaxy/tests/test_cloud_provider.mjs
+        openpilot/starpilot/galaxy/tests/test_catalog_startup.mjs)
+      test_command: >
+        PYTHONPATH="$PWD:$PWD/opendbc_repo" python3 -m unittest discover -s openpilot/starpilot/ioniq/tests -v
+    secrets: inherit

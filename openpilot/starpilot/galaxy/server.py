@@ -100,7 +100,7 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
                 remote_pairing=None, parked=None, camera_snapshot=None, clock=time.monotonic, starport_setup=None,
                 starport_client=None, navigation=None, offline_maps=None, drive_state=None, cloud_provider=None, cloud_offroad=None, projection_layout=None,
                 local_access=None, tmux_live=None, starport_logs=None, starport_log_sender=None, hotspot=None, toyota_tools=None,
-                replay_client=None, replay_root=None,
+                ioniq_tools=None, replay_client=None, replay_root=None,
                 spotify_setup=None, companion=None, phone_location=None, reverse_proxy=None, local_hostnames=None, sound_preview=None):
   from openpilot.starpilot.galaxy.local_hostnames import LocalHostnames
   hostname_source = local_hostnames if local_hostnames is not None else LocalHostnames(clock=clock)
@@ -239,6 +239,7 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
   recovery_gateway = None
   vehicle_gateway = vehicle_selection
   toyota_source = toyota_tools
+  ioniq_source = ioniq_tools
   model_source = models
   model_manager_source = model_manager
   plot_source = plots
@@ -503,6 +504,17 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
         toyota_source = ToyotaTools(params, context_source(params))
         server.toyota_tools_source = toyota_source
       return toyota_source
+
+  def ioniq_owner():
+    nonlocal ioniq_source
+    with settings_lock:
+      if ioniq_source is None:
+        from openpilot.common.params import Params
+        from openpilot.starpilot.galaxy.ioniq_tools import IoniqTools
+        params = Params()
+        ioniq_source = IoniqTools(params, context_source(params))
+        server.ioniq_tools_source = ioniq_source
+      return ioniq_source
 
   def vehicle_choices():
     nonlocal vehicle_gateway
@@ -1214,6 +1226,19 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
           self.json(503, {'error': 'Toyota settings are unavailable'})
         else:
           self.json(200, result) if self.settings_session() == identity else self.json(401, {'error': 'Sign in to Galaxy'})
+      elif path == '/api/ioniq-tools':
+        if not self.require_session():
+          return
+        identity = self.settings_session()
+        if identity is None:
+          self.json(401, {'error': 'Sign in to Galaxy'})
+          return
+        try:
+          result = ioniq_owner().page(*identity)
+        except (OSError, RuntimeError, ValueError):
+          self.json(503, {'error': 'Ioniq tools are unavailable'})
+        else:
+          self.json(200, result) if self.settings_session() == identity else self.json(401, {'error': 'Sign in to Galaxy'})
       elif path == '/api/vehicle-selection':
         if not self.require_session():
           return
@@ -1674,12 +1699,12 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
                       '/api/sounds/preview', '/api/sounds/download', '/api/sounds/cancel', '/api/software/action', '/api/drives/ignore',
                       '/api/recordings/delete-videos', '/api/sentry/notifications', '/api/sentry/events/delete', '/api/crash-reports/delete',
                       '/api/navigation/search', '/api/navigation/action', '/api/navigation/offline', '/api/drive-state/action',
-                      '/api/toyota-tools/action', '/api/vehicle-selection/preview', '/api/vehicle-selection/confirm'):
+                      '/api/toyota-tools/action', '/api/ioniq-tools/action', '/api/vehicle-selection/preview', '/api/vehicle-selection/confirm'):
         self.json(405, {'error': 'Method unavailable'})
         return
       if (path.startswith(('/api/companion/', '/api/replay/', '/api/recordings/', '/api/connect/', '/api/cameras/', '/api/settings/', '/api/maps/',
                            '/api/bluetooth/',
-                           '/api/starport/', '/api/spotify/', '/api/controllers/', '/api/vehicle-selection/', '/api/toyota-tools/',
+                           '/api/starport/', '/api/spotify/', '/api/controllers/', '/api/vehicle-selection/', '/api/toyota-tools/', '/api/ioniq-tools/',
                            '/api/models/', '/api/ui/', '/api/favorites/', '/api/sounds/', '/api/software/',
                            '/api/drives/', '/api/navigation/', '/api/drive-state/', '/api/sentry/', '/api/crash-reports/')) and
           not self.require_session()):
@@ -2630,6 +2655,24 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
         else:
           self.json(200, result) if self.settings_session() == identity else self.json(401, {'error': 'Sign in to Galaxy'})
         return
+      if path == '/api/ioniq-tools/action':
+        from openpilot.starpilot.galaxy.ioniq_tools import IoniqToolsChanged
+        identity = self.settings_session()
+        if identity is None:
+          self.json(401, {'error': 'Sign in to Galaxy'})
+          return
+        try:
+          with effect_lock:
+            result = ioniq_owner().action(payload, *identity, session_valid=lambda: self.settings_session() == identity)
+        except ValueError as err:
+          self.json(400, {'error': str(err) or 'Invalid Ioniq request'})
+        except IoniqToolsChanged:
+          self.json(409, {'error': 'Ioniq view expired or vehicle is not parked; refresh'})
+        except (OSError, RuntimeError):
+          self.json(503, {'error': 'Ioniq tools are unavailable'})
+        else:
+          self.json(200, result) if self.settings_session() == identity else self.json(401, {'error': 'Sign in to Galaxy'})
+        return
       if path.startswith('/api/vehicle-selection/'):
         identity = self.settings_session()
         if identity is None:
@@ -3033,6 +3076,8 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
     server.settings_source = settings_gateway
   if toyota_source is not None:
     server.toyota_tools_source = toyota_source
+  if ioniq_source is not None:
+    server.ioniq_tools_source = ioniq_source
   if bluetooth_source is not None:
     server.bluetooth_source = bluetooth_source
   if starport_setup_source is not None:

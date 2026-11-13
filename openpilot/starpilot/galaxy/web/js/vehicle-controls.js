@@ -6,6 +6,7 @@ import { reactive } from "../vendor/vue/vue.esm-browser.js"
 import { SettingsPage } from "./settings.js"
 import { GalaxySelect } from "./galaxy-select.js"
 import { ToyotaToolsPage } from "./toyota-tools.js"
+import { IoniqToolsPage } from "./ioniq-tools.js"
 import { beginSave, finishSave } from "./save-feedback.js"
 
 export function validVehiclePage(data) {
@@ -166,7 +167,7 @@ export class VehicleSelectionFeed {
 }
 
 export const VehicleControlsPage = {
-  components: { ToyotaToolsPage, GxDialog, GxState, GxNotice, SettingsPage, GalaxySelect },
+  components: { ToyotaToolsPage, IoniqToolsPage, GxDialog, GxState, GxNotice, SettingsPage, GalaxySelect },
   props: { mode: { type: String, required: true }, unauthorized: { type: Function, required: true } },
   setup(props) {
     const state = reactive({ status: "idle", data: null, pending: null, busy: false, error: "", query: "", make: "", manualSelectionOpen: false })
@@ -239,6 +240,7 @@ export const VehicleControlsPage = {
           </template>
         </div></article>
         <ToyotaToolsPage :mode="mode" :unauthorized="unauthorized" />
+        <IoniqToolsPage :mode="mode" :unauthorized="unauthorized" />
         <SettingsPage ref="vehicleSettings" :mode="mode" :unauthorized="unauthorized" initial-page="vehicle" title="Vehicle settings" />
         <GxDialog v-if="state.pending" labelledby="gx-vehicle-controls-confirm-title" @close="feed.cancel()"><h3 id="gx-vehicle-controls-confirm-title">Confirm Vehicle Selection</h3><p>{{ state.pending.question }}</p>
             <p>The choice takes effect after the next start.</p>
