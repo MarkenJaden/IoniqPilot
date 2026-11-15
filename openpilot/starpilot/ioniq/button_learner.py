@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
-import time
-from typing import Any, Callable
+from typing import Any
 
 from openpilot.starpilot.ioniq.storage import ioniq_storage_root, read_json, write_json_atomic
 
@@ -249,7 +250,7 @@ class ButtonLearnEngine:
     if self.detected_presses > 0 and not ready_momentary:
       self.message = (
         f'Erkannt: {min(self.detected_presses, self.target_presses)}/{self.target_presses} Tastendrücke '
-        f'für "{self.label}"...'
+        + f'für "{self.label}"...'
       )
 
     if ready_momentary:
@@ -274,7 +275,7 @@ class ButtonLearnEngine:
 
   def _accept_winner(self, winner: _BitTracker, *, mode: str, alternatives: list[_BitTracker],
                      mono_s: float) -> dict[str, Any]:
-    now = time.time()
+    now = datetime.now(UTC).timestamp()
     binding = {
       'id': f'btn_{int(now * 1000)}_{winner.address:03x}_{winner.byte_idx}_{winner.bit_mask:02x}',
       'name': self.label,
@@ -307,7 +308,7 @@ class ButtonLearnEngine:
     self.state = 'learned'
     self.message = (
       f'Knopf "{self.label}" erfolgreich gelernt: Bus {winner.bus}, '
-      f'0x{winner.address:03X} Byte {winner.byte_idx} Maske 0x{winner.bit_mask:02X} ({mode}).'
+      + f'0x{winner.address:03X} Byte {winner.byte_idx} Maske 0x{winner.bit_mask:02X} ({mode}).'
     )
     return binding
 

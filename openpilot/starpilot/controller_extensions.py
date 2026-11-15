@@ -1,6 +1,5 @@
 import time
 
-import openpilot.cereal.messaging as messaging
 from openpilot.common.swaglog import cloudlog
 
 from openpilot.starpilot.controllers.toyota_cruise import ToyotaCruisePreference, capability as toyota_cruise_capability
@@ -9,6 +8,7 @@ from openpilot.starpilot.controllers.toyota_cruise import ToyotaCruisePreference
 class ResumePlanInputs:
   """Card-owned fresh plan evidence, independent of Controls' saved preference snapshot."""
   def __init__(self, *, boottime=False):
+    import openpilot.cereal.messaging as messaging
     self.boottime = boottime
     from openpilot.starpilot.longitudinal.inputs import ResumeFreshness
     self.sm = messaging.SubMaster(["deviceState", "carState", "longitudinalPlan"], frequency=25)
@@ -172,6 +172,19 @@ def configure_controller(CI, params):
     except OSError:
       controller.torque_ev_lead_inputs = None
       cloudlog.exception('Optional torque EV lead input transport unavailable')
+
+  configure_hyundai_auto_main(controller, cp)
+
+
+def configure_hyundai_auto_main(controller, cp):
+  if controller is None or cp is None or cp.brand != 'hyundai' or not getattr(controller, '_auto_main_eligible', False):
+    return
+  try:
+    from openpilot.starpilot.ioniq.storage import read_config
+    controller.auto_cruise_main = bool(read_config().get('autoCruiseMain', True))
+  except Exception:
+    cloudlog.exception('Optional Hyundai auto cruise main configuration unavailable')
+    controller.auto_cruise_main = True
 
 
 def observe_controller_can(CI, can_list):

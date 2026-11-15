@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_CONFIG: dict[str, Any] = {
-  'scanOnStart': True,
+  'scanOnStart': False,
+  'autoCruiseMain': True,
   'passiveMonitorEnabled': True,
   'recorderEnabled': True,
   'recorderAutoOnFault': True,
@@ -26,12 +27,15 @@ def ioniq_storage_root(root: Path | str | None = None) -> Path:
   if root is not None:
     target = Path(root)
   else:
-    try:
-      from openpilot.starpilot.storage import starpilot_storage_root
-      target = starpilot_storage_root() / 'ioniq'
-    except (ImportError, OSError, RuntimeError, ValueError):
-      env_root = os.environ.get('IONIQ_STORAGE_ROOT')
-      target = Path(env_root) if env_root else (Path.home() / '.starpilot' / 'ioniq')
+    env_root = os.environ.get('IONIQ_STORAGE_ROOT', '').strip()
+    if env_root:
+      target = Path(env_root)
+    else:
+      try:
+        from openpilot.starpilot.storage import starpilot_storage_root
+        target = starpilot_storage_root() / 'ioniq'
+      except (ImportError, OSError, RuntimeError, ValueError):
+        target = Path.home() / '.starpilot' / 'ioniq'
   target.mkdir(parents=True, exist_ok=True)
   return target
 
@@ -66,7 +70,7 @@ def clamp_config(raw: dict[str, Any] | None) -> dict[str, Any]:
   """Normalize and bound persisted Ioniq configuration."""
   cfg = dict(DEFAULT_CONFIG)
   if isinstance(raw, dict):
-    for key in ('scanOnStart', 'passiveMonitorEnabled', 'recorderEnabled', 'recorderAutoOnFault'):
+    for key in ('scanOnStart', 'autoCruiseMain', 'passiveMonitorEnabled', 'recorderEnabled', 'recorderAutoOnFault'):
       if isinstance(raw.get(key), bool):
         cfg[key] = raw[key]
     cfg['recorderPreSeconds'] = _clamp_float(raw.get('recorderPreSeconds'), cfg['recorderPreSeconds'], 5.0, 120.0)

@@ -525,5 +525,91 @@ class TestHyundaiLongitudinalSafetyCameraSCCRefreshHybrid(HyundaiRefreshHybridGa
     self.assertFalse(self._tx(common.make_msg(2, 0x420, 8)))
 
 
+class TestHyundaiAutoMainSafety(unittest.TestCase):
+  def setUp(self):
+    self.safety = libsafety_py.libsafety
+    self.packer = CANPackerSafety("hyundai_can_generated")
+
+  def _init_mode(self, flags=0, model=CarParams.SafetyModel.hyundai, experience=0):
+    self.safety.set_alternative_experience(experience)
+    self.safety.set_safety_hooks(model, flags)
+    self.safety.init_tests()
+
+  def _clu11(self, button=0, main_button=0, bus=0):
+    return self.packer.make_can_msg_safety("CLU11", bus, {
+      "CF_Clu_CruiseSwState": button,
+      "CF_Clu_CruiseSwMain": main_button,
+      "CF_Clu_AliveCnt1": 0,
+    })
+
+  def _scc11(self, main_on, bus=0):
+    return self.packer.make_can_msg_safety("SCC11", bus, {"MainMode_ACC": int(bool(main_on))})
+
+  def test_classic_scc_auto_main_tx_and_rx_gating(self):
+    self._init_mode(HyundaiSafetyFlags.HYBRID_GAS | HyundaiSafetyFlags.HAS_LDA_BUTTON | 0x0400, experience=32)
+    # Must see SCC11 on the active SCC bus before Main standby pulse is permitted.
+    self.assertFalse(self.safety.safety_tx_hook(self._clu11(button=0, main_button=1)))
+
+    # Once SCC11 reports Main off, clean Main pulse is allowed.
+    self.assertTrue(self.safety.safety_rx_hook(self._scc11(False, bus=0)))
+    self.assertFalse(self.safety.get_acc_main_on())
+    self.assertTrue(self.safety.safety_tx_hook(self._clu11(button=0, main_button=1)))
+
+    # Non-zero button + main_button together is rejected (even if controls_allowed is true).
+    self.safety.set_controls_allowed(1)
+    self.assertFalse(self.safety.safety_tx_hook(self._clu11(button=1, main_button=1)))
+    self.assertFalse(self.safety.safety_tx_hook(self._clu11(button=2, main_button=1)))
+    self.assertFalse(self.safety.safety_tx_hook(self._clu11(button=4, main_button=1)))
+    self.safety.set_controls_allowed(0)
+
+    # Blocked if brake or gas pressed or already cruise engaged.
+    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("TCS13", 0, {"DriverOverride": 2, "AliveCounterTCS": 0}, fix_checksum=checksum))
+    self.assertFalse(self.safety.safety_tx_hook(self._clu11(button=0, main_button=1)))
+    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("TCS13", 0, {"DriverOverride": 0, "AliveCounterTCS": 1}, fix_checksum=checksum))
+    self.assertTrue(self.safety.safety_tx_hook(self._clu11(button=0, main_button=1)))
+
+    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("E_EMS11", 0, {"CR_Vcu_AccPedDep_Pos": 5}, fix_checksum=checksum))
+    self.assertFalse(self.safety.safety_tx_hook(self._clu11(button=0, main_button=1)))
+    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("E_EMS11", 0, {"CR_Vcu_AccPedDep_Pos": 0}, fix_checksum=checksum))
+    self.assertTrue(self.safety.safety_tx_hook(self._clu11(button=0, main_button=1)))
+
+    self.safety.set_cruise_engaged_prev(True)
+    self.assertFalse(self.safety.safety_tx_hook(self._clu11(button=0, main_button=1)))
+    self.safety.set_cruise_engaged_prev(False)
+
+    # Once SCC11 MainMode_ACC turns on, further Main TX is blocked.
+    self.assertTrue(self.safety.safety_rx_hook(self._scc11(True, bus=0)))
+    self.assertTrue(self.safety.get_acc_main_on())
+    self.assertFalse(self.safety.safety_tx_hook(self._clu11(button=0, main_button=1)))
+
+    # Re-initializing resets hyundai_classic_scc11_seen.
+    self._init_mode(HyundaiSafetyFlags.HYBRID_GAS)
+    self.assertFalse(self.safety.safety_tx_hook(self._clu11(button=0, main_button=1)))
+
+    # Verify Auto-Main works identically when alternative_experience == 0 (AOL disabled, standard hyundai_rx_hook)
+    self._init_mode(HyundaiSafetyFlags.HYBRID_GAS, experience=0)
+    self.assertTrue(self.safety.safety_rx_hook(self._scc11(False, bus=0)))
+    self.assertTrue(self.safety.safety_tx_hook(self._clu11(button=0, main_button=1)))
+    self.assertTrue(self.safety.safety_rx_hook(self._scc11(True, bus=0)))
+    self.assertFalse(self.safety.safety_tx_hook(self._clu11(button=0, main_button=1)))
+    # Legacy safety model must never allow Auto-Main TX
+    self._init_mode(HyundaiSafetyFlags.HYBRID_GAS, model=CarParams.SafetyModel.hyundaiLegacy, experience=0)
+    self.safety.safety_rx_hook(self._scc11(False, bus=0))
+    self.assertFalse(self.safety.safety_tx_hook(self._clu11(button=0, main_button=1)))
+
+  def test_camera_scc_and_excluded_modes_respect_bus_and_isolation(self):
+    # CAMERA_SCC expects SCC11 on bus 2 and CLU11 TX on bus 2
+    self._init_mode(HyundaiSafetyFlags.CAMERA_SCC | HyundaiSafetyFlags.HYBRID_GAS)
+    self.assertTrue(self.safety.safety_rx_hook(self._scc11(False, bus=0)))  # wrong bus for camera SCC
+    self.assertFalse(self.safety.safety_tx_hook(self._clu11(button=0, main_button=1, bus=2)))
+    self.assertTrue(self.safety.safety_rx_hook(self._scc11(False, bus=2)))
+    self.assertTrue(self.safety.safety_tx_hook(self._clu11(button=0, main_button=1, bus=2)))
+
+    # NON_SCC must not accept Main TX even after 0x420
+    self._init_mode(HyundaiSafetyFlags.NON_SCC | HyundaiSafetyFlags.HYBRID_GAS)
+    self.safety.safety_rx_hook(self._scc11(False, bus=0))
+    self.assertFalse(self.safety.safety_tx_hook(self._clu11(button=0, main_button=1, bus=0)))
+
+
 if __name__ == "__main__":
   unittest.main()

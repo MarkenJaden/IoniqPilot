@@ -18,7 +18,7 @@ def _build_libsafety(release: bool = False, output_dir: str | Path | None = None
 
   cflags = [
     '-Wall', '-Wextra', '-Werror', '-nostdlib', '-fno-builtin',
-    '-std=gnu11', '-Wfatal-errors', '-Wno-pointer-to-int-cast',
+    '-std=gnu11', '-Wfatal-errors', '-Wno-pointer-to-int-cast', '-Wno-sign-compare',
     '-g', '-O0', '-fno-omit-frame-pointer',
   ]
   # Coverage must exclude the branches inserted by UBSan.

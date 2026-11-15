@@ -93,7 +93,7 @@ from openpilot.starpilot.feature_runtime import (requested as feature_requested,
 from openpilot.starpilot.saved_source import read_saved
 from openpilot.starpilot.vehicle_selection import startup_candidate
 from openpilot.starpilot.vehicle_preferences import VehicleStartupPreferences
-from openpilot.starpilot.controller_extensions import configure_controller, observe_controller_can, order_controller_can
+from openpilot.starpilot.controller_extensions import configure_controller, configure_hyundai_auto_main, observe_controller_can, order_controller_can
 from openpilot.starpilot.vehicle_startup import VehicleStartupOwner
 from openpilot.starpilot.controllers.wheel_actions import LIFETIME_NS as WHEEL_ACTION_MAX_AGE_NS, WheelPublisher, key_for
 from openpilot.starpilot.controllers.cruise_action import CruiseActionConsumer, eligible as cruise_action_eligible
@@ -336,14 +336,6 @@ class Car:
                         forced_candidate=startup_candidate(self.params, developer_fingerprint=bool(os.getenv('FINGERPRINT'))))
       self.RI = interfaces[self.CI.CP.carFingerprint].RadarInterface(self.CI.CP)
       self.CP = self.CI.CP
-
-      if getattr(self.CP, 'brand', None) == 'hyundai' and not self.CP.notCar:
-        try:
-          from openpilot.starpilot.ioniq.runtime import maybe_run_startup_diagnostic
-          maybe_run_startup_diagnostic(self.can_callbacks[0], self.can_callbacks[1], obd_callback(self.params),
-                                       brand=self.CP.brand)
-        except Exception:
-          cloudlog.exception('Failed to run Ioniq startup diagnostic window')
 
       # continue onto next fingerprinting step in pandad
       self.params.put_bool("FirmwareQueryDone", True, block=True)
@@ -1997,6 +1989,8 @@ class Car:
         pitch_input = getattr(self.CI.CC, 'long_pitch_input', None)
         if pitch_input is not None:
           self.CI.CC.long_pitch = pitch_input.update(time.monotonic_ns())
+        if getattr(self.CI.CC, '_auto_main_eligible', False):
+          configure_hyundai_auto_main(self.CI.CC, self.CP)
         next_cruise_read = now + 1.0
       time.sleep(0.1)
 

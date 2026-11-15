@@ -103,8 +103,8 @@ def create_lkas11(packer, frame, CP, apply_torque, steer_req,
   return packer.make_can_msg("LKAS11", 0, values)
 
 
-def create_clu11(packer, frame, clu11, button, CP):
-  values = {s: clu11[s] for s in [
+def create_clu11(packer, frame, clu11, button, CP, *, main_button=None):
+  values = {s: clu11.get(s, 0) for s in [
     "CF_Clu_CruiseSwState",
     "CF_Clu_CruiseSwMain",
     "CF_Clu_SldMainSW",
@@ -119,6 +119,8 @@ def create_clu11(packer, frame, clu11, button, CP):
     "CF_Clu_AliveCnt1",
   ]}
   values["CF_Clu_CruiseSwState"] = button
+  if main_button is not None:
+    values["CF_Clu_CruiseSwMain"] = int(bool(main_button))
   values["CF_Clu_AliveCnt1"] = frame % 0x10
   # send buttons to camera on camera-scc based cars
   bus = CanBus(CP).ECAN if is_blended(CP) else 2 if CP.flags & HyundaiFlags.CAMERA_SCC else 0

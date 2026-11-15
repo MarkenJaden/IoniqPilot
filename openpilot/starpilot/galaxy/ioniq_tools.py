@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 import hashlib
 from pathlib import Path
 import secrets
 import threading
 import time
-from typing import Any, Callable
+from typing import Any
 
 from openpilot.starpilot.ioniq.button_learner import (
   BUTTON_ACTIONS,
@@ -27,6 +28,7 @@ from openpilot.starpilot.ioniq.uds_dtc import (
   apply_clear_result,
   apply_scan_result,
   clear_ioniq_dtcs,
+  clear_passive_warnings_state,
   queue_diagnostic_action,
   read_diagnostics_state,
   scan_ioniq_ecus,
@@ -117,6 +119,7 @@ class IoniqTools:
       self.root,
       fco_scale_ul=float(cfg.get('fcoScaleUlPerTick', 0.128)),
       price_per_liter=float(cfg.get('fuelPriceEurPerLiter', 1.75)),
+      tank_capacity_liters=float(cfg.get('tankCapacityLiters', 45.0)),
     ).snapshot()
     recorder_status = EventFlightRecorder(self.root).status()
 
@@ -167,6 +170,7 @@ class IoniqTools:
     parked_only_actions = frozenset((
       'clear_dtcs', 'save_config', 'start_learn', 'cancel_learn',
       'delete_binding', 'update_binding', 'delete_recording', 'delete_trip',
+      'delete_refuel', 'reset_fuel_calibration',
     ))
     if act in parked_only_actions and not parked:
       raise IoniqToolsChanged('Car must be parked for this operation')
@@ -209,6 +213,11 @@ class IoniqTools:
       state = read_diagnostics_state(self.root)
       state['pendingAction'] = None
       write_diagnostics_state(state, self.root)
+      return {'saved': True, 'diagnostics': state}
+
+    if act == 'clear_passive_warnings':
+      state = clear_passive_warnings_state(self.root)
+      push_runtime_command('clear_passive_warnings', {}, root=self.root)
       return {'saved': True, 'diagnostics': state}
 
     if act == 'record_snapshot':
@@ -319,18 +328,76 @@ class IoniqTools:
       liters = _parse_float(payload.get('liters'))
       full_tank = bool(payload.get('fullTank', True))
       price = _parse_optional_float(payload.get('pricePerLiter'))
+      cost_eur = _parse_optional_float(payload.get('costEur'))
       odometer = _parse_optional_float(payload.get('odometerKm'))
       notes = str(payload.get('notes', '')).strip()[:120]
       cfg = read_config(self.root)
-      tracker = FuelTripTracker(self.root, fco_scale_ul=float(cfg.get('fcoScaleUlPerTick', 0.128)),
-                              price_per_liter=float(cfg.get('fuelPriceEurPerLiter', 1.75)))
-      res = tracker.log_refuel(liters, full_tank=full_tank, price_per_liter=price, odometer_km=odometer, notes=notes)
-      # Sync updated calibration back to config.json cleanly
+      tracker = FuelTripTracker(
+        self.root,
+        fco_scale_ul=float(cfg.get('fcoScaleUlPerTick', 0.128)),
+        price_per_liter=float(cfg.get('fuelPriceEurPerLiter', 1.75)),
+        tank_capacity_liters=float(cfg.get('tankCapacityLiters', 45.0)),
+      )
+      res = tracker.log_refuel(
+        liters,
+        full_tank=full_tank,
+        price_per_liter=price,
+        cost_eur=cost_eur,
+        odometer_km=odometer,
+        notes=notes,
+      )
+      # Sync updated calibration and price back to config.json cleanly
       cfg['fuelCalibrationFactor'] = res['calibrationFactor']
-      if price is not None:
-        cfg['fuelPriceEurPerLiter'] = price
+      refuel_entry = res.get('refuel') or {}
+      if refuel_entry.get('pricePerLiter') is not None:
+        cfg['fuelPriceEurPerLiter'] = float(refuel_entry['pricePerLiter'])
       write_config(cfg, self.root)
       return {'saved': True, 'refuelResult': res, 'fuel': tracker.snapshot()}
+
+    if act == 'update_refuel':
+      refuel_id = str(payload.get('id', ''))
+      liters = _parse_optional_float(payload.get('liters'))
+      price = _parse_optional_float(payload.get('pricePerLiter'))
+      cost_eur = _parse_optional_float(payload.get('costEur'))
+      odometer = _parse_optional_float(payload.get('odometerKm'))
+      notes = str(payload['notes']).strip()[:120] if 'notes' in payload and payload['notes'] is not None else None
+      cfg = read_config(self.root)
+      tracker = FuelTripTracker(
+        self.root,
+        fco_scale_ul=float(cfg.get('fcoScaleUlPerTick', 0.128)),
+        price_per_liter=float(cfg.get('fuelPriceEurPerLiter', 1.75)),
+        tank_capacity_liters=float(cfg.get('tankCapacityLiters', 45.0)),
+      )
+      updated = tracker.update_refuel(
+        refuel_id,
+        liters=liters,
+        price_per_liter=price,
+        cost_eur=cost_eur,
+        odometer_km=odometer,
+        notes=notes,
+      )
+      return {'saved': True, 'refuel': updated, 'fuel': tracker.snapshot()}
+
+    if act == 'delete_refuel':
+      if payload.get('confirmed') is not True:
+        raise ValueError('Confirmation required')
+      refuel_id = str(payload.get('id', ''))
+      tracker = FuelTripTracker(self.root)
+      deleted = tracker.delete_refuel(refuel_id)
+      if not deleted:
+        raise ValueError('Refuel entry not found')
+      return {'saved': True, 'deleted': refuel_id, 'fuel': tracker.snapshot()}
+
+    if act == 'reset_fuel_calibration':
+      if payload.get('confirmed') is not True:
+        raise ValueError('Confirmation required')
+      cfg = read_config(self.root)
+      cfg['fuelCalibrationFactor'] = 1.0
+      write_config(cfg, self.root)
+      tracker = FuelTripTracker(self.root)
+      tracker.reset_calibration()
+      push_runtime_command('reset_fuel_calibration', {}, root=self.root)
+      return {'saved': True, 'fuel': tracker.snapshot()}
 
     if act == 'dismiss_refuel_alert':
       tracker = FuelTripTracker(self.root)

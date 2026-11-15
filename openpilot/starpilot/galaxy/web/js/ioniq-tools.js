@@ -61,6 +61,7 @@ export const IoniqToolsPage = {
         refuelLiters: "",
         refuelFull: true,
         refuelPrice: "",
+        refuelCostEur: "",
         refuelOdo: "",
         refuelNotes: "",
         manualTripLabel: "",
@@ -107,10 +108,14 @@ export const IoniqToolsPage = {
     diagnostics() { return this.state.data?.diagnostics || {} },
     lastScan() { return this.diagnostics.lastScan || null },
     liveSummary() { return this.diagnostics.liveSummary || {} },
+    battery12v() { return this.liveSummary.battery12vHealth || {} },
+    thermal() { return this.liveSummary.thermalStatus || {} },
     passiveWarnings() { return this.diagnostics.passive?.activeWarnings || [] },
+    warningHistory() { return this.diagnostics.passive?.warningHistory || [] },
     fuel() { return this.state.data?.fuel || {} },
     currentTank() { return this.fuel.currentTank || {} },
     activeTrip() { return this.fuel.activeTrip || null },
+    sourceDiag() { return this.fuel.sourceDiagnostics || this.activeTrip?.sourceDiagnostics || {} },
     learnStatus() { return this.state.data?.buttons?.learnStatus || { state: "idle", detectedPresses: 0, targetPresses: 3 } },
     bindings() { return this.state.data?.buttons?.bindings || [] },
     recordingsList() { return this.state.data?.recordings?.recordings || [] },
@@ -169,8 +174,37 @@ export const IoniqToolsPage = {
         if (!this.state.refuelOdo && result.diagnostics?.liveSummary?.odometerKm) {
           this.state.refuelOdo = String(result.diagnostics.liveSummary.odometerKm)
         }
+        if (!this.state.refuelLiters && result.fuel?.refuelAlert?.estimatedAddedLiters) {
+          this.state.refuelLiters = String(result.fuel.refuelAlert.estimatedAddedLiters)
+          this.state.refuelFull = Boolean(result.fuel.refuelAlert.isLikelyFullTank ?? true)
+          this.onRefuelLitersOrPriceChange()
+        }
       }
       if (this.alive) this.timer = setTimeout(() => this.load(), this.pollIntervalMs)
+    },
+    onRefuelLitersOrPriceChange() {
+      const l = parseFloat(String(this.state.refuelLiters).replace(",", "."))
+      const p = parseFloat(String(this.state.refuelPrice).replace(",", "."))
+      if (!Number.isNaN(l) && l > 0 && !Number.isNaN(p) && p > 0) {
+        this.state.refuelCostEur = (l * p).toFixed(2)
+      }
+    },
+    onRefuelCostChange() {
+      const l = parseFloat(String(this.state.refuelLiters).replace(",", "."))
+      const c = parseFloat(String(this.state.refuelCostEur).replace(",", "."))
+      if (!Number.isNaN(l) && l > 0 && !Number.isNaN(c) && c > 0) {
+        this.state.refuelPrice = (c / l).toFixed(3)
+      }
+    },
+    prefillFromAlert() {
+      const alert = this.fuel.refuelAlert
+      if (!alert) return
+      this.state.tab = "fuel"
+      if (alert.estimatedAddedLiters) {
+        this.state.refuelLiters = String(alert.estimatedAddedLiters)
+      }
+      this.state.refuelFull = Boolean(alert.isLikelyFullTank ?? true)
+      this.onRefuelLitersOrPriceChange()
     },
     async act(actionName, fields = {}) {
       if (!this.state.data?.view) return null
@@ -223,19 +257,22 @@ export const IoniqToolsPage = {
         return
       }
       const price = parseFloat(String(this.state.refuelPrice).replace(",", "."))
+      const costEur = parseFloat(String(this.state.refuelCostEur).replace(",", "."))
       const odo = this.state.refuelOdo ? parseFloat(String(this.state.refuelOdo).replace(",", ".")) : null
       const res = await this.act("log_refuel", {
         liters,
         fullTank: this.state.refuelFull,
         pricePerLiter: Number.isNaN(price) ? null : price,
+        costEur: Number.isNaN(costEur) ? null : costEur,
         odometerKm: Number.isNaN(odo) ? null : odo,
         notes: this.state.refuelNotes,
       })
       if (res?.saved) {
         this.state.refuelLiters = ""
+        this.state.refuelCostEur = ""
         this.state.refuelNotes = ""
         this.state.notice = this.state.refuelFull
-          ? "Volltanken gespeichert & Tankzyklus abgeschlossen."
+          ? "Volltanken gespeichert & Tankzyklus + Kalibrierung aktualisiert."
           : "Teiltanken verbucht."
       }
     },
@@ -268,8 +305,14 @@ export const IoniqToolsPage = {
           </div>
 
           <GxNotice v-if="fuel.refuelAlert" tone="info">
-            Tankfüllstand um {{ fuel.refuelAlert.deltaBars }} Balken gestiegen — jetzt Tankstopp eintragen!
-            <button type="button" class="gx-btn gx-btn--tonal" @click="act('dismiss_refuel_alert')">Ausblenden</button>
+            <strong>Tankvorgang automatisch erkannt:</strong> Tankuhr um +{{ fuel.refuelAlert.deltaBars }} Balken gestiegen
+            (von {{ formatNum(fuel.refuelAlert.fromPct, 0, '%') }} auf {{ formatNum(fuel.refuelAlert.toPct, 0, '%') }},
+            geschätzt ~{{ formatNum(fuel.refuelAlert.estimatedAddedLiters, 1, ' L') }}).
+            Bitte tatsächliche Literzahl und Preis eintragen / bestätigen:
+            <div class="gx-actions">
+              <button type="button" class="gx-btn" @click="prefillFromAlert()">Werte übernehmen</button>
+              <button type="button" class="gx-btn gx-btn--tonal" @click="act('dismiss_refuel_alert')">Ausblenden</button>
+            </div>
           </GxNotice>
 
           <!-- TAB 1: FUEL & TRIPS -->
@@ -277,25 +320,44 @@ export const IoniqToolsPage = {
             <h4>Aktueller Tankzyklus (Volltanken zu Volltanken)</h4>
             <p>
               Distanz: <strong>{{ formatNum(currentTank.distanceKm, 1, ' km') }}</strong> ·
-              Geschätzt: <strong>{{ formatNum(currentTank.estimatedFuelLiters, 2, ' L') }}</strong>
+              Berechnet: <strong>{{ formatNum(currentTank.estimatedFuelLiters, 2, ' L') }}</strong>
               ({{ formatNum(currentTank.estimatedLPer100Km, 2, ' L/100km') }}) ·
-              EV-Anteil: <strong>{{ formatNum(currentTank.evDistanceKm, 1, ' km') }}</strong> ·
+              EV-Strecke: <strong>{{ formatNum(currentTank.evDistanceKm, 1, ' km') }}</strong> ·
               Verbrenner: <strong>{{ formatNum(currentTank.iceDistanceKm, 1, ' km') }}</strong> ·
-              Fahrten: <strong>{{ currentTank.tripCount || 0 }}</strong> ·
+              Fahrten: <strong>{{ currentTank.tripCount || 0 }}</strong>
+            </p>
+            <p>
+              Tacho-Bordcomputer (CLU13): <strong>{{ formatNum(liveSummary.clusterAvgFc, 1, ' ' + (liveSummary.clusterAvgFcUnit || 'L/100km')) }}</strong> ·
+              Tankuhr: <strong>{{ formatNum(liveSummary.fuelDispPct, 0, '%') }}</strong>
+              (~{{ formatNum((liveSummary.fuelDispPct || 0) * 0.45, 1, ' L') }} von 45 L · Restreichweite {{ liveSummary.dteKm ?? '—' }} km) ·
               Kalibrierung: <strong>{{ formatNum(fuel.calibrationFactor, 3, 'x') }}</strong>
+              <button v-if="fuel.calibrationFactor && Math.abs(fuel.calibrationFactor - 1.0) > 0.005" type="button" class="gx-btn gx-btn--tonal"
+                :disabled="state.busy || !state.data.parked"
+                @click="confirmAction('reset_fuel_calibration', 'Kalibrierung zurücksetzen?', 'Kalibrierfaktor wieder auf 1.000x zurücksetzen?', {})">Auf 1.0x zurücksetzen</button>
             </p>
             <p v-if="fuel.lifetimeTankAvgLPer100Km">
-              Realer Gesamtdurchschnitt (Volltanken): <strong>{{ formatNum(fuel.lifetimeTankAvgLPer100Km, 2, ' L/100km') }}</strong>
-              <span v-if="liveSummary.fuelDispPct !== null && liveSummary.fuelDispPct !== undefined"> · Tankuhr: {{ formatNum(liveSummary.fuelDispPct, 0, '%') }} ({{ liveSummary.dteKm ?? '—' }} km Rest)</span>
+              Realer Gesamtdurchschnitt (aus Volltankungen): <strong>{{ formatNum(fuel.lifetimeTankAvgLPer100Km, 2, ' L/100km') }}</strong>
             </p>
 
+            <div class="gx-panel gx-stack">
+              <strong>Verbrauchs-Datenquellen Diagnose (Live-CAN)</strong>
+              <p>
+                Aktive Quelle: <strong>{{ sourceDiag.activeSource || activeTrip?.sourceMode || 'Bereit' }}</strong> ·
+                FCO-Zähler (EMS20): {{ sourceDiag.fcoValid ? 'Aktiv (' + formatNum(sourceDiag.fcoLiters, 3, ' L') + ')' : 'Nicht aktiv / Modell-Fallback' }} ·
+                Motor-Kennfeld (EMS11/H12): {{ formatNum(sourceDiag.modelLiters, 3, ' L') }} (aktuell {{ formatNum(liveSummary.instantFuelRateLph, 2, ' L/h') }}) ·
+                Bordcomputer-Fallback (CLU13): {{ formatNum(sourceDiag.clusterFallbackLiters, 3, ' L') }}
+              </p>
+            </div>
+
             <div v-if="activeTrip" class="gx-panel gx-stack">
-              <strong>Laufende Fahrt (Motorstart → Motorstopp)</strong>
+              <strong>Laufende Fahrt (Zündung EIN → Zündung AUS)</strong>
               <p>
                 Dauer: {{ formatDuration(activeTrip.durationS) }} ·
                 Distanz: {{ formatNum(activeTrip.distanceKm, 2, ' km') }} ·
-                Verbrauch: {{ formatNum(activeTrip.fuelLiters, 2, ' L') }} ({{ formatNum(activeTrip.avgLPer100Km, 2, ' L/100km') }}) ·
-                EV: {{ formatNum(activeTrip.evTimePct, 0, '%') }} ·
+                Verbrauch: <strong>{{ formatNum(activeTrip.fuelLiters, 2, ' L') }}</strong>
+                (<strong>{{ formatNum(activeTrip.avgLPer100Km, 2, ' L/100km') }}</strong> · {{ formatNum(activeTrip.estimatedCostEur, 2, ' €') }}) ·
+                Tacho-Ø: {{ formatNum(activeTrip.clusterAvgLPer100Km ?? activeTrip.clusterAvgFci, 1, ' L/100km') }} ·
+                EV-Anteil: {{ formatNum(activeTrip.evTimePct, 0, '% Zeit') }} / {{ formatNum(activeTrip.evDistancePct, 0, '% Strecke') }} ·
                 Quelle: {{ activeTrip.sourceMode }}
               </p>
               <div class="gx-actions">
@@ -307,15 +369,16 @@ export const IoniqToolsPage = {
               <button type="button" class="gx-btn gx-btn--tonal" :disabled="state.busy" @click="act('start_manual_trip', { label: state.manualTripLabel })">Fahrt manuell starten</button>
             </div>
 
-            <h4>Tankstopp / Volltanken erfassen</h4>
+            <h4>Tankstopp / Volltanken erfassen &amp; Kostenanalyse</h4>
             <div class="gx-actions">
-              <label class="gx-field-group">Getankte Liter<input class="gx-field" type="number" step="0.01" min="0.5" max="90" v-model="state.refuelLiters" placeholder="z.B. 34.85"></label>
-              <label class="gx-field-group">Preis €/L<input class="gx-field" type="number" step="0.001" v-model="state.refuelPrice" placeholder="1.75"></label>
+              <label class="gx-field-group">Getankte Liter<input class="gx-field" type="number" step="0.01" min="0.5" max="90" v-model="state.refuelLiters" @input="onRefuelLitersOrPriceChange()" placeholder="z.B. 38.40"></label>
+              <label class="gx-field-group">Preis €/L<input class="gx-field" type="number" step="0.001" v-model="state.refuelPrice" @input="onRefuelLitersOrPriceChange()" placeholder="1.759"></label>
+              <label class="gx-field-group">Gesamtpreis €<input class="gx-field" type="number" step="0.01" v-model="state.refuelCostEur" @input="onRefuelCostChange()" placeholder="z.B. 67.55"></label>
               <label class="gx-field-group">km-Stand (optional)<input class="gx-field" type="number" step="0.1" v-model="state.refuelOdo"></label>
-              <label class="gx-field-group">Notiz<input class="gx-field" v-model="state.refuelNotes" maxlength="120" placeholder="Tankstelle / E5"></label>
+              <label class="gx-field-group">Notiz<input class="gx-field" v-model="state.refuelNotes" maxlength="120" placeholder="Tankstelle / E10 / E5"></label>
             </div>
             <div class="gx-row gx-row--borderless">
-              <span class="gx-row__info gx-row__label">Vollgetankt (Tankzyklus abschließen &amp; Verbrauch kalibrieren)</span>
+              <span class="gx-row__info gx-row__label">Vollgetankt (Tankzyklus abschließen, realen L/100km &amp; €/100km berechnen und CAN-Sensorik kalibrieren)</span>
               <label class="gx-switch"><input type="checkbox" role="switch" v-model="state.refuelFull"><span class="gx-switch__track"></span><span class="gx-switch__thumb"></span></label>
             </div>
             <div class="gx-actions">
@@ -323,45 +386,96 @@ export const IoniqToolsPage = {
               <button type="button" class="gx-btn gx-btn--tonal" :disabled="state.busy" @click="downloadTripsCsv()">Trips CSV exportieren</button>
             </div>
 
-            <h4>Letzte Fahrten ({{ (fuel.trips || []).length }})</h4>
+            <h4>Erfasste Tankvorgänge ({{ (fuel.refuels || []).length }})</h4>
+            <p v-if="!(fuel.refuels || []).length">Noch keine Tankvorgänge eingetragen.</p>
+            <div v-for="rf in (fuel.refuels || []).slice(0, 10)" :key="rf.id" class="gx-row">
+              <div class="gx-row__info">
+                <div class="gx-row__label">
+                  {{ formatTimestamp(rf.timestamp) }} — {{ formatNum(rf.liters, 2, ' L') }}
+                  ({{ rf.fullTank ? 'Vollgetankt' : 'Teiltankung' }})
+                  <span v-if="rf.costEur"> · {{ formatNum(rf.costEur, 2, ' €') }} ({{ formatNum(rf.pricePerLiter, 3, ' €/L') }})</span>
+                </div>
+                <div>
+                  km-Stand: {{ rf.odometerKm ? formatNum(rf.odometerKm, 1, ' km') : '—' }}
+                  <span v-if="rf.notes"> · {{ rf.notes }}</span>
+                </div>
+              </div>
+              <button type="button" class="gx-btn gx-btn--tonal" :disabled="!state.data.parked || state.busy"
+                @click="confirmAction('delete_refuel', 'Tankvorgang löschen?', 'Diesen Tank-Eintrag wirklich entfernen?', { id: rf.id })">Löschen</button>
+            </div>
+
+            <h4>Volltanken-zu-Volltanken Auswertung ({{ (fuel.tankHistory || []).length }})</h4>
+            <div v-for="tank in (fuel.tankHistory || []).slice(0, 10)" :key="tank.id" class="gx-row">
+              <div class="gx-row__info">
+                <div class="gx-row__label">
+                  {{ formatTimestamp(tank.endedAt) }} — Real: <strong>{{ formatNum(tank.actualLPer100Km, 2, ' L/100km') }}</strong>
+                  <span v-if="tank.costPer100Km"> ({{ formatNum(tank.costPer100Km, 2, ' €/100km') }})</span>
+                </div>
+                <div>
+                  {{ formatNum(tank.distanceKm, 1, ' km') }} · Getankt: {{ formatNum(tank.actualLiters, 2, ' L') }} ·
+                  CAN-Schätzung: {{ formatNum(tank.estimatedLiters, 2, ' L') }} (Abw. {{ formatNum(tank.estimateErrorPct, 1, '%') }}) ·
+                  Gesamtkosten: {{ formatNum(tank.costEur, 2, ' €') }}
+                </div>
+              </div>
+            </div>
+
+            <h4>Letzte Einzelfahrten ({{ (fuel.trips || []).length }})</h4>
             <div v-for="trip in (fuel.trips || []).slice(0, 15)" :key="trip.id" class="gx-row">
               <div class="gx-row__info">
                 <div class="gx-row__label">{{ trip.label || formatTimestamp(trip.startedAt) }}</div>
                 <div>
                   {{ formatNum(trip.distanceKm, 2, ' km') }} · {{ formatDuration(trip.durationS) }} ·
-                  {{ formatNum(trip.fuelLiters, 2, ' L') }} ({{ formatNum(trip.avgLPer100Km, 2, ' L/100km') }}) ·
-                  EV {{ formatNum(trip.evTimePct, 0, '%') }} · Tacho {{ formatNum(trip.clusterAvgFci, 1) }} · {{ formatNum(trip.estimatedCostEur, 2, ' €') }}
+                  <strong>{{ formatNum(trip.fuelLiters, 2, ' L') }}</strong> (<strong>{{ formatNum(trip.avgLPer100Km, 2, ' L/100km') }}</strong>) ·
+                  EV {{ formatNum(trip.evTimePct, 0, '%') }} · Tacho {{ formatNum(trip.clusterAvgLPer100Km ?? trip.clusterAvgFci, 1, ' L/100km') }} ·
+                  {{ formatNum(trip.estimatedCostEur, 2, ' €') }} · Quelle: {{ trip.sourceMode }}
                 </div>
               </div>
               <button type="button" class="gx-btn gx-btn--tonal" :disabled="!state.data.parked || state.busy"
                 @click="confirmAction('delete_trip', 'Fahrt löschen?', 'Diese aufgezeichnete Fahrt endgültig entfernen?', { id: trip.id })">Löschen</button>
-            </div>
-
-            <h4>Volltanken-zu-Volltanken Historie ({{ (fuel.tankHistory || []).length }})</h4>
-            <div v-for="tank in (fuel.tankHistory || []).slice(0, 10)" :key="tank.id" class="gx-row">
-              <div class="gx-row__info">
-                <div class="gx-row__label">{{ formatTimestamp(tank.endedAt) }} — Real: {{ formatNum(tank.actualLPer100Km, 2, ' L/100km') }}</div>
-                <div>
-                  {{ formatNum(tank.distanceKm, 1, ' km') }} · Getankt: {{ formatNum(tank.actualLiters, 2, ' L') }} ·
-                  Geschätzt: {{ formatNum(tank.estimatedLiters, 2, ' L') }} ({{ formatNum(tank.estimateErrorPct, 1, '%') }}) · {{ formatNum(tank.costEur, 2, ' €') }}
-                </div>
-              </div>
             </div>
           </div>
 
           <!-- TAB 2: ECU & DTC DIAGNOSTICS -->
           <div v-if="state.tab === 'dtc'" class="gx-stack">
             <div class="gx-row gx-row--borderless">
-              <span class="gx-row__info gx-row__label">Automatisches Steuergeräte-Auslesen beim Fahrzeugstart (ELM327 Fenster)</span>
-              <label class="gx-switch"><input type="checkbox" role="switch" :checked="state.data.config?.scanOnStart"
+              <span class="gx-row__info gx-row__label">Tempomat-Hauptschalter (Cruise Main) nach Motorstart automatisch aktivieren</span>
+              <label class="gx-switch"><input type="checkbox" role="switch" :checked="state.data.config?.autoCruiseMain !== false"
+                :disabled="state.busy || !state.data.parked" @change="saveConfigToggle('autoCruiseMain', $event.target.checked)"><span class="gx-switch__track"></span><span class="gx-switch__thumb"></span></label>
+            </div>
+            <div class="gx-row gx-row--borderless">
+              <span class="gx-row__info gx-row__label">Automatisches Steuergeräte-Auslesen beim Start (nur bei Bedarf aktivieren, verzögert Panda-Start kurz)</span>
+              <label class="gx-switch"><input type="checkbox" role="switch" :checked="Boolean(state.data.config?.scanOnStart)"
                 :disabled="state.busy || !state.data.parked" @change="saveConfigToggle('scanOnStart', $event.target.checked)"><span class="gx-switch__track"></span><span class="gx-switch__thumb"></span></label>
             </div>
-            <p>
-              Live CAN: Motor {{ formatNum(liveSummary.engineRpm, 0, ' U/min') }} ·
-              Kühlmittel {{ formatNum(liveSummary.coolantTempC, 0, ' °C') }} ·
-              12V {{ formatNum(liveSummary.bat12vVoltageV, 2, ' V') }} (SoC {{ formatNum(liveSummary.bat12vSocPct, 0, '%') }} / SoH {{ formatNum(liveSummary.bat12vSohPct, 0, '%') }}) ·
-              MIL {{ liveSummary.milLamp ? 'AN' : 'Aus' }}
-            </p>
+
+            <!-- 12V IBS & HEV THERMAL HEALTH CARDS -->
+            <div class="gx-panel gx-stack">
+              <strong>12V-Hilfsbatterie &amp; IBS-Diagnose (Kofferraum / LDC-Wandler)</strong>
+              <p>
+                Status: <strong>{{ battery12v.label || 'Warte auf BAT11…' }}</strong> ·
+                Spannung: <strong>{{ formatNum(battery12v.voltageV ?? liveSummary.bat12vVoltageV, 2, ' V') }}</strong> ·
+                Ladezustand (SoC): <strong>{{ formatNum(battery12v.socPct ?? liveSummary.bat12vSocPct, 0, '%') }}</strong> ·
+                Gesundheit (SoH): <strong>{{ formatNum(battery12v.sohPct ?? liveSummary.bat12vSohPct, 0, '%') }}</strong> ·
+                Strom: {{ formatNum(battery12v.currentA ?? liveSummary.bat12vCurrentA, 1, ' A') }} ·
+                LDC-Ladung: {{ (battery12v.ldcCharging || battery12v.chargingActive) ? 'Aktiv (HV → 12V)' : 'Ruhe / Entladung' }}
+              </p>
+              <p v-if="battery12v.advice">{{ battery12v.advice }}</p>
+            </div>
+
+            <div class="gx-panel gx-stack">
+              <strong>Hybrid-Thermik &amp; Warmlauf-Monitor (1.6 GDi Kappa)</strong>
+              <p>
+                Phase: <strong>{{ thermal.label || 'Warte auf EMS12…' }}</strong> ·
+                Kühlmittel: <strong>{{ formatNum(thermal.coolantTempC ?? liveSummary.coolantTempC, 0, ' °C') }}</strong> ·
+                Ansaugluft: {{ formatNum(thermal.intakeAirTempC ?? thermal.intakeTempC ?? liveSummary.intakeTempC, 0, ' °C') }} ·
+                Außentemp.: {{ formatNum(thermal.ambientTempC ?? liveSummary.ambientTempC, 1, ' °C') }} ·
+                Innenraum: {{ formatNum(thermal.cabinTempC ?? liveSummary.cabinTempC, 1, ' °C') }} ·
+                Motor: {{ formatNum(liveSummary.engineRpm, 0, ' U/min') }} ·
+                MIL im Tacho: <strong>{{ liveSummary.milLamp ? 'AKTIV (Gelb)' : 'Aus' }}</strong>
+              </p>
+              <p v-if="thermal.explanation">{{ thermal.explanation }}</p>
+            </div>
+
             <div class="gx-actions">
               <button type="button" class="gx-btn" :disabled="state.busy" @click="act('scan_dtcs')">Steuergeräte jetzt scannen / vormerken</button>
               <select class="gx-field" v-model="state.clearTarget">
@@ -369,43 +483,93 @@ export const IoniqToolsPage = {
                 <option v-for="ecu in state.data.ecuCatalog" :key="ecu.ecuId" :value="ecu.ecuId">{{ ecu.ecuId }} ({{ ecu.txHex }})</option>
               </select>
               <button type="button" class="gx-btn gx-btn--tonal" :disabled="state.busy || !state.data.parked"
-                @click="confirmAction('clear_dtcs', 'Fehlercodes wirklich löschen?', 'Ausgewählte DTCs werden im ELM327-Diagnosefenster gelöscht.', { target: state.clearTarget })">DTCs löschen</button>
+                @click="confirmAction('clear_dtcs', 'Fehlercodes wirklich löschen?', 'Ausgewählte DTCs werden im Steuergerät gelöscht.', { target: state.clearTarget })">DTCs löschen</button>
+              <button v-if="passiveWarnings.length || warningHistory.length" type="button" class="gx-btn gx-btn--tonal" :disabled="state.busy"
+                @click="act('clear_passive_warnings')">CAN-Warnungshistorie zurücksetzen</button>
             </div>
 
             <GxNotice v-if="diagnostics.pendingAction" tone="info">
-              Vorgemerkt für Diagnosefenster beim nächsten Start: {{ diagnostics.pendingAction.type.toUpperCase() }} ({{ diagnostics.pendingAction.target }})
+              Vorgemerkt für nächstes ELM327-Diagnosefenster (Zündung EIN, Motor aus): {{ diagnostics.pendingAction.type.toUpperCase() }} ({{ diagnostics.pendingAction.target }})
               <button type="button" class="gx-btn gx-btn--tonal" @click="act('cancel_pending_diag')">Abbrechen</button>
             </GxNotice>
 
             <template v-for="w in passiveWarnings" :key="w.code">
-              <GxNotice tone="warning">[Live-CAN {{ w.ecuId }}] {{ w.message }}</GxNotice>
+              <GxNotice tone="warning">[Aktive Live-CAN Warnung · {{ w.ecuId }}] {{ w.message }}</GxNotice>
             </template>
 
             <template v-if="lastScan">
-              <p>Letzter Scan: {{ formatTimestamp(lastScan.scannedAt) }} · Steuergeräte geantwortet: {{ lastScan.ecusResponded }}/{{ lastScan.ecusTotal }} · DTCs: {{ (lastScan.dtcs || []).length }}</p>
+              <div class="gx-panel gx-stack">
+                <strong>Diagnose-Zusammenfassung ({{ formatTimestamp(lastScan.scannedAt) }})</strong>
+                <p>
+                  Steuergeräte online: <strong>{{ lastScan.ecusResponded }}/{{ lastScan.ecusTotal }}</strong> ·
+                  Gespeicherte DTCs: <strong>{{ (lastScan.dtcs || []).length }}</strong>
+                  (Aktiv: {{ lastScan.analysis?.activeCount || 0 }} · Ausstehend: {{ lastScan.analysis?.pendingCount || 0 }} · Historisch: {{ lastScan.analysis?.historicCount || 0 }}) ·
+                  Handlungsempfehlung: <strong>{{ lastScan.analysis?.overallUrgencyLabel || 'Unauffällig' }}</strong>
+                </p>
+                <p v-if="lastScan.readiness">
+                  OBD-II Readiness (0x7E0): MIL {{ lastScan.readiness.milOn ? 'AN' : 'Aus' }} ·
+                  Abgas-DTCs: {{ lastScan.readiness.emissionDtcCount }} ·
+                  Offene Selbsttests: {{ (lastScan.readiness.incompleteMonitors || []).length ? lastScan.readiness.incompleteMonitors.join(', ') : 'Alle abgeschlossen' }}
+                </p>
+                <p v-if="lastScan.freezeFrame">
+                  OBD Freeze-Frame (Umgebungsdaten beim Auftreten von {{ lastScan.freezeFrame.dtcCode }}):
+                  Drehzahl {{ formatNum(lastScan.freezeFrame.rpm, 0, ' U/min') }} ·
+                  Geschwindigkeit {{ formatNum(lastScan.freezeFrame.speedKph, 0, ' km/h') }} ·
+                  Kühlmittel {{ formatNum(lastScan.freezeFrame.coolantTempC, 0, ' °C') }} ·
+                  Motorlast {{ formatNum(lastScan.freezeFrame.engineLoadPct, 1, '%') }}
+                </p>
+                <p v-if="lastScan.analysis?.milExplanation">{{ lastScan.analysis.milExplanation }}</p>
+              </div>
+
               <div v-for="ins in (lastScan.analysis?.insights || [])" :key="ins.title" class="gx-row">
                 <div class="gx-row__info">
                   <div class="gx-row__label">{{ ins.title }}</div>
                   <div>{{ ins.detail }}</div>
                 </div>
               </div>
-              <h4>Gefundene Fehlercodes</h4>
+
+              <h4>Detaillierte Fehlercode-Analyse (DTCs)</h4>
               <p v-if="!(lastScan.dtcs || []).length">Keine gespeicherten Fehlercodes im letzten Scan.</p>
-              <div v-for="dtc in (lastScan.dtcs || [])" :key="dtc.ecuId + dtc.code + dtc.source" class="gx-row">
-                <div class="gx-row__info">
-                  <div class="gx-row__label">{{ dtc.code }} · {{ dtc.ecuId }} ({{ dtc.system }}) {{ dtc.active ? '[AKTIV]' : dtc.pending ? '[AUSSTEHEND]' : '[HISTORISCH]' }}</div>
-                  <div>{{ dtc.title }} — {{ dtc.hint }}</div>
+              <div v-for="dtc in (lastScan.dtcs || [])" :key="dtc.ecuId + dtc.code + dtc.source" class="gx-panel gx-stack">
+                <div class="gx-row__label">
+                  <strong>{{ dtc.code }}</strong> · {{ dtc.ecuId }} ({{ dtc.system }}) ·
+                  {{ dtc.active ? '[AKTIV]' : dtc.pending ? '[AUSSTEHEND / SPORADISCH]' : '[GESPEICHERT / HISTORISCH]' }} ·
+                  Empfehlung: <strong>{{ dtc.urgencyLabel || 'Prüfen' }}</strong>
+                </div>
+                <div><strong>{{ dtc.title }}</strong></div>
+                <div v-if="dtc.stateExplanation">{{ dtc.stateExplanation }}</div>
+                <div><strong>Werkstatt- &amp; Handlungshinweis:</strong> {{ dtc.workshopAdvice || dtc.hint }}</div>
+                <div v-if="(dtc.causes || []).length">
+                  <strong>Typische Ursachen beim 2016 Ioniq Hybrid:</strong> {{ dtc.causes.join(' · ') }}
+                </div>
+                <div v-if="dtc.freezeFrame">
+                  <strong>Freeze-Frame beim Fehler:</strong>
+                  {{ formatNum(dtc.freezeFrame.rpm, 0, ' U/min') }},
+                  {{ formatNum(dtc.freezeFrame.speedKph, 0, ' km/h') }},
+                  Kühlmittel {{ formatNum(dtc.freezeFrame.coolantTempC, 0, ' °C') }},
+                  Last {{ formatNum(dtc.freezeFrame.engineLoadPct, 1, '%') }}
+                </div>
+                <div v-if="dtc.snapshotHex">
+                  <strong>UDS 0x19 0x04 Snapshot-Daten:</strong> <code>{{ dtc.snapshotHex }}</code>
                 </div>
               </div>
+
               <h4>Steuergeräte Übersicht</h4>
               <div v-for="ecu in (lastScan.ecus || [])" :key="ecu.ecuId" class="gx-row">
                 <div class="gx-row__info">
                   <div class="gx-row__label">{{ ecu.ecuId }} · {{ ecu.name }} ({{ ecu.txHex }}/{{ ecu.rxHex }})</div>
-                  <div>{{ ecu.online ? 'Online' : 'Keine Antwort' }} · DTCs: {{ ecu.dtcCount }} <span v-if="ecu.partNumber">· Teilenr: {{ ecu.partNumber }}</span></div>
+                  <div>{{ ecu.online ? 'Online' : 'Keine Antwort' }} · DTCs: {{ ecu.dtcCount }} <span v-if="ecu.partNumber">· Teilenr: {{ ecu.partNumber }}</span> <span v-if="ecu.softwareVersion">· SW: {{ ecu.softwareVersion }}</span></div>
                 </div>
               </div>
             </template>
-            <p v-else>Noch kein aktiver ECU-Scan ausgeführt. Oben auf „Steuergeräte jetzt scannen / vormerken“ tippen.</p>
+            <div v-else class="gx-panel gx-stack">
+              <strong>Noch kein aktiver ECU-Scan ausgeführt</strong>
+              <p>
+                Tipp zur Motorkontrollleuchte (MIL): Wenn die gelbe Motorkontrollleuchte in der Vergangenheit kurz an war,
+                bleibt der auslösende Fehlercode (inkl. Freeze-Frame-Umgebungsdaten) im Motor- oder Hybridsteuergerät gespeichert.
+                Tippe oben im Stand (Zündung EIN) auf „Steuergeräte jetzt scannen / vormerken“, um alle 14 Steuergeräte auszulesen.
+              </p>
+            </div>
           </div>
 
           <!-- TAB 3: 3X BUTTON LEARNER -->
@@ -449,7 +613,7 @@ export const IoniqToolsPage = {
           <!-- TAB 4: EVENT & TELEMETRY RECORDER -->
           <div v-if="state.tab === 'recorder'" class="gx-stack">
             <div class="gx-row gx-row--borderless">
-              <span class="gx-row__info gx-row__label">Automatische Vor/Nach-Aufzeichnung bei CAN-Fehlern</span>
+              <span class="gx-row__info gx-row__label">Automatische Vor/Nach-Aufzeichnung bei echten CAN-Fehlern (Start-Lampentest wird ausgeblendet)</span>
               <label class="gx-switch"><input type="checkbox" role="switch" :checked="state.data.config?.recorderAutoOnFault"
                 :disabled="state.busy || !state.data.parked" @change="saveConfigToggle('recorderAutoOnFault', $event.target.checked)"><span class="gx-switch__track"></span><span class="gx-switch__thumb"></span></label>
             </div>

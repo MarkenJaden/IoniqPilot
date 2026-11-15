@@ -166,7 +166,9 @@ def parse_uds_dtc_response(payload: bytes, ecu: EcuTarget) -> tuple[list[dict], 
     if b0 == 0 and b1 == 0 and ftb == 0:
       continue
     code = decode_dtc_bytes(b0, b1, ftb if ftb else None)
-    records.append(enrich_dtc_record(ecu.ecu_id, ecu.name, code, status, source='uds_19_02'))
+    rec = enrich_dtc_record(ecu.ecu_id, ecu.name, code, status, source='uds_19_02')
+    rec['_dtcBytes'] = (b0, b1, ftb)
+    records.append(rec)
   return records, None
 
 
@@ -188,7 +190,9 @@ def parse_obd_dtc_response(payload: bytes, ecu: EcuTarget, mode: int) -> list[di
     if hi == 0 and lo == 0:
       continue
     code = decode_dtc_bytes(hi, lo)
-    records.append(enrich_dtc_record(ecu.ecu_id, ecu.name, code, None, source=source_name))
+    rec = enrich_dtc_record(ecu.ecu_id, ecu.name, code, None, source=source_name)
+    rec['_dtcBytes'] = (hi, lo, 0)
+    records.append(rec)
   return records
 
 
@@ -198,6 +202,91 @@ def _decode_ascii_did(payload: bytes, did_hi: int, did_lo: int) -> str | None:
   raw = payload[3:].replace(b'\x00', b' ').strip()
   text = ''.join(chr(b) for b in raw if 32 <= b < 127).strip()
   return text or None
+
+
+def _parse_obd_mode01_readiness(payload: bytes) -> dict | None:
+  """Parse OBD-II Mode 01 PID 01 (0x41 0x01 A B C D) MIL + readiness monitor status."""
+  if len(payload) < 6 or payload[0] != 0x41 or payload[1] != 0x01:
+    return None
+  a, b, c, d = payload[2], payload[3], payload[4], payload[5]
+  mil_on = bool(a & 0x80)
+  dtc_count = a & 0x7F
+  monitors = {
+    'misfire': {'supported': bool(b & 0x01), 'incomplete': bool(b & 0x10)},
+    'fuelSystem': {'supported': bool(b & 0x02), 'incomplete': bool(b & 0x20)},
+    'components': {'supported': bool(b & 0x04), 'incomplete': bool(b & 0x40)},
+    'catalyst': {'supported': bool(c & 0x01), 'incomplete': bool(d & 0x01)},
+    'evap': {'supported': bool(c & 0x04), 'incomplete': bool(d & 0x04)},
+    'oxygenSensor': {'supported': bool(c & 0x20), 'incomplete': bool(d & 0x20)},
+    'oxygenSensorHeater': {'supported': bool(c & 0x40), 'incomplete': bool(d & 0x40)},
+    'egr': {'supported': bool(c & 0x80), 'incomplete': bool(d & 0x80)},
+  }
+  incomplete_names = [k for k, v in monitors.items() if v['supported'] and v['incomplete']]
+  return {
+    'milOn': mil_on,
+    'emissionDtcCount': dtc_count,
+    'incompleteMonitors': incomplete_names,
+    'monitors': monitors,
+  }
+
+
+def _query_obd_live_and_freeze_frame(
+  can_send: Callable[[list[Any]], Any],
+  can_recv: Callable[..., list[Any]],
+  *,
+  bus: int = 1,
+  clock: Callable[[], float] = time.monotonic,
+) -> tuple[dict | None, dict, dict | None]:
+  """Query OBD-II Mode 01 readiness/live PIDs and Mode 02 freeze-frame from ECM (0x7E0/0x7E8)."""
+  readiness: dict | None = None
+  live: dict[str, Any] = {}
+  freeze: dict[str, Any] = {}
+
+  # Mode 01 PIDs: 01 (readiness), 05 (coolant), 0C (RPM), 0D (speed), 10 (MAF), 2F (fuel level), 42 (ECU V), 5E (fuel rate)
+  for pid in (0x01, 0x05, 0x0C, 0x0D, 0x10, 0x2F, 0x42, 0x5E):
+    resp = isotp_exchange_many(can_send, can_recv, [(0x7E0, 0x7E8, bytes([0x01, pid]))], bus=bus, timeout_s=0.18, clock=clock)
+    p = resp.get(0x7E8)
+    if not p or len(p) < 3 or p[0] != 0x41 or p[1] != pid:
+      continue
+    if pid == 0x01:
+      readiness = _parse_obd_mode01_readiness(p)
+    elif pid == 0x05 and len(p) >= 3:
+      live['coolantTempC'] = round(float(p[2]) - 40.0, 1)
+    elif pid == 0x0C and len(p) >= 4:
+      live['rpm'] = round(((p[2] << 8) | p[3]) / 4.0, 1)
+    elif pid == 0x0D and len(p) >= 3:
+      live['speedKph'] = float(p[2])
+    elif pid == 0x10 and len(p) >= 4:
+      maf = ((p[2] << 8) | p[3]) / 100.0
+      live['mafGps'] = round(maf, 2)
+      live['estimatedFuelRateLphFromMaf'] = round((maf * 3600.0) / (14.7 * 745.0), 3)
+    elif pid == 0x2F and len(p) >= 3:
+      live['fuelLevelPct'] = round(p[2] * 100.0 / 255.0, 1)
+    elif pid == 0x42 and len(p) >= 4:
+      live['controlModuleV'] = round(((p[2] << 8) | p[3]) / 1000.0, 2)
+    elif pid == 0x5E and len(p) >= 4:
+      live['fuelRateLph'] = round(((p[2] << 8) | p[3]) * 0.05, 3)
+
+  # Mode 02 Freeze Frame frame 0x00: PID 02 (DTC that caused freeze frame), 04 (load), 05 (coolant), 0C (RPM), 0D (speed)
+  r02 = isotp_exchange_many(can_send, can_recv, [(0x7E0, 0x7E8, b'\x02\x02\x00')], bus=bus, timeout_s=0.18, clock=clock)
+  p02 = r02.get(0x7E8)
+  if p02 and len(p02) >= 5 and p02[0] == 0x42 and p02[1] == 0x02 and (p02[3] != 0 or p02[4] != 0):
+    freeze['dtcCode'] = decode_dtc_bytes(p02[3], p02[4])
+    for pid in (0x04, 0x05, 0x0C, 0x0D):
+      rf = isotp_exchange_many(can_send, can_recv, [(0x7E0, 0x7E8, bytes([0x02, pid, 0x00]))], bus=bus, timeout_s=0.15, clock=clock)
+      pf = rf.get(0x7E8)
+      if not pf or len(pf) < 4 or pf[0] != 0x42 or pf[1] != pid:
+        continue
+      if pid == 0x04:
+        freeze['engineLoadPct'] = round(pf[3] * 100.0 / 255.0, 1)
+      elif pid == 0x05:
+        freeze['coolantTempC'] = round(float(pf[3]) - 40.0, 1)
+      elif pid == 0x0C and len(pf) >= 5:
+        freeze['rpm'] = round(((pf[3] << 8) | pf[4]) / 4.0, 1)
+      elif pid == 0x0D:
+        freeze['speedKph'] = float(pf[3])
+
+  return readiness, live, (freeze or None)
 
 
 def scan_ioniq_ecus(
@@ -210,7 +299,7 @@ def scan_ioniq_ecus(
   timeout_s: float = 0.55,
   clock: Callable[[], float] = time.monotonic,
 ) -> dict:
-  """Scan all Ioniq AE HEV ECUs for UDS/OBD-II DTCs and ECU metadata."""
+  """Scan all Ioniq AE HEV ECUs for UDS/OBD-II DTCs, freeze-frames, readiness, and ECU metadata."""
   started_at = _utc_timestamp()
   ecu_statuses: list[dict] = []
   dtcs: list[dict] = []
@@ -244,6 +333,13 @@ def scan_ioniq_ecus(
       if ecu is not None:
         obd_by_rx[rx].extend(parse_obd_dtc_response(payload, ecu, mode))
 
+  # Query OBD-II Mode 01 readiness + live PIDs and Mode 02 freeze-frame if ECM responded
+  readiness: dict | None = None
+  obd_live: dict[str, Any] = {}
+  obd_freeze: dict | None = None
+  if 0x7E8 in uds_resps or obd_by_rx.get(0x7E8):
+    readiness, obd_live, obd_freeze = _query_obd_live_and_freeze_frame(can_send, can_recv, bus=bus, clock=clock)
+
   for ecu in ecus:
     payload = uds_resps.get(ecu.rx_addr)
     ecu_dtcs: list[dict] = []
@@ -255,6 +351,17 @@ def scan_ioniq_ecus(
       dedup_key = (rec['ecuId'], rec['code'].split('-', 1)[0], rec['source'])
       if dedup_key not in seen_dtc_keys:
         seen_dtc_keys.add(dedup_key)
+        dtc_bytes = rec.pop('_dtcBytes', None)
+        # Try UDS 0x19 0x04 DTCSnapshotRecordByDTCNumber for discovered UDS DTCs
+        if dtc_bytes is not None and rec['source'] == 'uds_19_02':
+          b0, b1, ftb = dtc_bytes
+          snap_req = [(ecu.tx_addr, ecu.rx_addr, bytes([0x19, 0x04, b0, b1, ftb, 0xFF]))]
+          snap_resp = isotp_exchange_many(can_send, can_recv, snap_req, bus=bus, timeout_s=0.18, clock=clock)
+          sp = snap_resp.get(ecu.rx_addr)
+          if sp and len(sp) > 6 and sp[0] == 0x59 and sp[1] == 0x04:
+            rec['snapshotHex'] = sp[6:].hex()
+        if obd_freeze and obd_freeze.get('dtcCode') == rec['code'].split('-', 1)[0]:
+          rec['freezeFrame'] = dict(obd_freeze)
         dtcs.append(rec)
 
     part_no = _decode_ascii_did(ident_resps.get(ecu.rx_addr, b''), 0xF1, 0x87)
@@ -283,6 +390,9 @@ def scan_ioniq_ecus(
     'ecusTotal': len(ecu_statuses),
     'ecus': ecu_statuses,
     'dtcs': dtcs,
+    'readiness': readiness,
+    'obdLive': obd_live,
+    'freezeFrame': obd_freeze,
     'analysis': analysis,
   }
 
@@ -341,16 +451,48 @@ def clear_ioniq_dtcs(
 
 
 class PassiveEcuMonitor:
-  """Always-on passive CAN fault/health monitor (zero TX required)."""
+  """Always-on passive CAN fault/health monitor (zero TX required) with boot/bulb-check blanking & debounce."""
 
-  def __init__(self) -> None:
+  def __init__(self, *, boot_blanking_s: float = 8.0, debounce_s: float = 2.5, min_samples: int = 8) -> None:
+    self.boot_blanking_s = boot_blanking_s
+    self.debounce_s = debounce_s
+    self.min_samples = min_samples
     self.active_warnings: dict[str, dict] = {}
     self.warning_history: list[dict] = []
     self._last_low_12v_seen = False
+    self._first_mono_s: float | None = None
+    self._ign_on_since_mono: float | None = None
+    self._candidate_since: dict[str, tuple[float, int]] = {}
 
-  def update(self, can_state: IoniqCanState, wall_time: float | None = None) -> list[dict]:
+  def clear_passive_warnings(self) -> None:
+    """Clear active passive warnings and stored passive warning history."""
+    self.active_warnings.clear()
+    self.warning_history.clear()
+    self._candidate_since.clear()
+
+  def update(self, can_state: IoniqCanState, wall_time: float | None = None, *, mono_s: float | None = None) -> list[dict]:
     """Compare current CAN flags with previous state and return newly raised fault events."""
     now = wall_time if wall_time is not None else _utc_timestamp()
+
+    # Track startup and ignition-on bulb-check blanking when running in real time (mono_s provided).
+    if mono_s is not None:
+      if self._first_mono_s is None:
+        self._first_mono_s = mono_s
+      if can_state.ignition_on:
+        if self._ign_on_since_mono is None:
+          self._ign_on_since_mono = mono_s
+      else:
+        self._ign_on_since_mono = None
+        self._candidate_since.clear()
+        self.active_warnings.clear()
+        return []
+
+      in_boot_blanking = (mono_s - self._first_mono_s) < self.boot_blanking_s
+      in_ign_blanking = self._ign_on_since_mono is not None and (mono_s - self._ign_on_since_mono) < self.boot_blanking_s
+      if in_boot_blanking or in_ign_blanking:
+        self._candidate_since.clear()
+        return []
+
     detected: dict[str, tuple[str, str, str]] = {}
 
     if can_state.mil_lamp:
@@ -363,8 +505,12 @@ class PassiveEcuMonitor:
       detected['TCU_WARN'] = ('TCU', 'warning', f'6-DCT Getriebewarnung aktiv (msg={can_state.tcu_warn_msg}, drv={can_state.tcu_dri_warn1})')
     if can_state.dct_hill_hold_warn:
       detected['DCT_HILL_HOLD'] = ('TCU', 'warning', 'DCT Überhitzungs-/Berganfahrwarnung (TCU_DCT14)')
-    if can_state.abs_defect or can_state.ebd_defect or can_state.abs_warn_lamp or can_state.ebd_warn_lamp:
-      detected['ABS_EBD_WARN'] = ('ESC', 'critical', 'ABS/EBD Bremsensystem-Warnleuchte aktiv')
+    # ABS/EBD warning lamp is on during stationary ignition bulb-check; require either actual defect flag or moving vehicle (> 5 km/h) when mono_s is active
+    abs_lamp_valid = (can_state.abs_warn_lamp or can_state.ebd_warn_lamp) and (
+      mono_s is None or can_state.best_speed_kph() > 5.0 or can_state.engine_is_firing()
+    )
+    if can_state.abs_defect or can_state.ebd_defect or abs_lamp_valid:
+      detected['ABS_EBD_WARN'] = ('ESC', 'critical', 'ABS/EBD Bremssystem-Warnleuchte aktiv')
     if can_state.fca_fail_info > 0:
       detected['FCA_FAIL'] = ('SCC', 'warning', f'Frontkollisionswarnung / Radar-Störung (FCA_Failinfo={can_state.fca_fail_info})')
     if can_state.bat_12v_error or can_state.bat_12v_invalid:
@@ -374,13 +520,23 @@ class PassiveEcuMonitor:
       detected['BAT_12V_LOW'] = ('IBS', 'warning', f'12V-Batteriespannung niedrig ({can_state.bat_12v_voltage_v:.2f}V)')
     self._last_low_12v_seen = low_12v
 
-    new_events: list[dict] = []
-    # Clear resolved warnings
+    # Clear resolved warnings and candidate counters
+    for code in list(self._candidate_since):
+      if code not in detected:
+        self._candidate_since.pop(code, None)
     for code in list(self.active_warnings):
       if code not in detected:
         self.active_warnings.pop(code, None)
 
+    new_events: list[dict] = []
     for code, (ecu_id, severity, message) in detected.items():
+      if mono_s is not None:
+        start_mono, count = self._candidate_since.get(code, (mono_s, 0))
+        count += 1
+        self._candidate_since[code] = (start_mono, count)
+        if (mono_s - start_mono) < self.debounce_s or count < self.min_samples:
+          continue
+
       if code not in self.active_warnings:
         event = {
           'code': code,
@@ -432,6 +588,13 @@ def write_diagnostics_state(state: dict, root: Path | str | None = None) -> dict
   state['history'] = history
   write_json_atomic(diagnostics_path(root), state)
   return state
+
+
+def clear_passive_warnings_state(root: Path | str | None = None) -> dict:
+  """Clear passive warning history in diagnostics.json."""
+  state = read_diagnostics_state(root)
+  state['passive'] = {'activeWarnings': [], 'warningHistory': []}
+  return write_diagnostics_state(state, root)
 
 
 def queue_diagnostic_action(action_type: str, target: str = 'ALL', root: Path | str | None = None) -> dict:

@@ -59,6 +59,14 @@ test('IoniqToolsPage loads local dashboard and submits action cleanly', async ()
   assert.equal(ctx.state.data.vehicle.label, '2016 Hyundai Ioniq Hybrid (AE HEV)')
   assert.equal(ctx.state.refuelPrice, '1.79')
 
+  // Test automatic cost <-> price calculation helpers
+  ctx.state.refuelLiters = '30'
+  IoniqToolsPage.methods.onRefuelLitersOrPriceChange.call(ctx)
+  assert.equal(ctx.state.refuelCostEur, '53.70')
+  ctx.state.refuelCostEur = '54.00'
+  IoniqToolsPage.methods.onRefuelCostChange.call(ctx)
+  assert.equal(ctx.state.refuelPrice, '1.800')
+
   await ctx.act('scan_dtcs')
   clearTimeout(ctx.timer)
   ctx.alive = false
@@ -75,6 +83,9 @@ test('IoniqToolsPage exposes standalone Tools layout and handles mode transition
   assert.match(IoniqToolsPage.template, /Ioniq Diagnostics &amp; Fuel requires the device\. No operation was attempted\./)
   assert.match(IoniqToolsPage.template, /title="Hyundai Ioniq required"/)
   assert.match(IoniqToolsPage.template, /<GxNotice v-if="state\.error" tone="danger">/)
+  assert.match(IoniqToolsPage.template, /12V-Hilfsbatterie &amp; IBS-Diagnose/)
+  assert.match(IoniqToolsPage.template, /Hybrid-Thermik &amp; Warmlauf-Monitor/)
+  assert.match(IoniqToolsPage.template, /Verbrauchs-Datenquellen Diagnose/)
 
   let loads = 0
   let aborted = 0

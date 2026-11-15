@@ -110,6 +110,7 @@ static bool hyundai_blended_hda2 = false;
   {.msg = {{0x4F1, (pt_bus), 4, 50U, .ignore_checksum = true, .max_counter = 15U, .ignore_quality_flag = true}, {0}, {0}}},
 
 static bool hyundai_legacy = false;
+static bool hyundai_classic_scc11_seen = false;
 static bool hyundai_ray_pedal = false;
 static bool hyundai_ray_pedal_healthy = false;
 static uint32_t hyundai_ray_pedal_ts = 0U;
@@ -229,6 +230,17 @@ static void hyundai_blended_cancel_check(void) {
   }
 }
 
+static void hyundai_classic_scc11_rx(const CANPacket_t *msg) {
+  const uint8_t pt_bus = hyundai_blended_hda2 ? 1U : 0U;
+  if ((msg->addr == 0x420U) && (GET_LEN(msg) == 8U) && !hyundai_non_scc && !hyundai_blended_stock &&
+      !hyundai_blended_alpha && !hyundai_ray_pedal && !hyundai_longitudinal) {
+    if (((msg->bus == pt_bus) && !hyundai_camera_scc) || ((msg->bus == 2U) && hyundai_camera_scc)) {
+      acc_main_on = GET_BIT(msg, 0U);
+      hyundai_classic_scc11_seen = true;
+    }
+  }
+}
+
 static void hyundai_rx_hook(const CANPacket_t *msg) {
   classic_non_scc_aol_rx(msg);
   blended_aol_rx(msg);
@@ -250,6 +262,9 @@ static void hyundai_rx_hook(const CANPacket_t *msg) {
       hyundai_common_cruise_state_check(cruise_engaged);
     }
   }
+
+  // SCC11 carries MainMode_ACC on classic SCC cars
+  hyundai_classic_scc11_rx(msg);
 
   if (hyundai_blended_stock && (msg->addr == 0x421U) && (msg->bus == pt_bus)) {
     acc_main_on = GET_BIT(msg, 27U);
@@ -520,14 +535,18 @@ static bool hyundai_tx_hook(const CANPacket_t *msg) {
     }
   }
 
-  // BUTTONS: used for resume spamming and cruise cancellation
+  // BUTTONS: used for resume spamming, cruise cancellation, and automatic SCC Main standby
   if ((msg->addr == 0x4F1U) && !hyundai_longitudinal) {
     int button = msg->data[0] & 0x7U;
+    bool main_button = GET_BIT(msg, 3U);
 
-    bool allowed_resume = (button == 1) && controls_allowed;
-    bool allowed_set = hyundai_blended_stock && (button == 2) && controls_allowed;
-    bool allowed_cancel = (button == 4) && cruise_engaged_prev;
-    if (!(allowed_resume || allowed_set || allowed_cancel)) {
+    bool allowed_resume = (button == 1) && !main_button && controls_allowed;
+    bool allowed_set = hyundai_blended_stock && (button == 2) && !main_button && controls_allowed;
+    bool allowed_cancel = (button == 4) && !main_button && cruise_engaged_prev;
+    bool allowed_main = !hyundai_legacy && !hyundai_non_scc && !hyundai_blended_stock && !hyundai_blended_alpha &&
+                        !hyundai_ray_pedal && hyundai_classic_scc11_seen && !acc_main_on &&
+                        (button == 0) && main_button && !cruise_engaged_prev && !brake_pressed && !gas_pressed;
+    if (!(allowed_resume || allowed_set || allowed_cancel || allowed_main)) {
       tx = false;
     }
   }
@@ -665,6 +684,7 @@ static safety_config hyundai_init(uint16_t param) {
     hyundai_longitudinal = true;
   }
   hyundai_legacy = false;
+  hyundai_classic_scc11_seen = false;
 
   safety_config ret;
 #ifdef ALLOW_DEBUG
@@ -937,6 +957,7 @@ static safety_config hyundai_legacy_init(uint16_t param) {
   hyundai_ray_pedal_healthy = false;
   hyundai_longitudinal = false;
   hyundai_camera_scc = false;
+  hyundai_classic_scc11_seen = false;
   safety_config ret = BUILD_SAFETY_CFG(hyundai_legacy_rx_checks, HYUNDAI_TX_MSGS);
   if ((param & 0xFF00U) == 0xE900U) {
     const safety_config denied = {0};
@@ -958,6 +979,7 @@ static safety_config hyundai_legacy_init(uint16_t param) {
 
 static void hyundai_optional_rx_hook(const CANPacket_t *msg) {
   hyundai_daw_rx(msg);
+  hyundai_classic_scc11_rx(msg);
   if ((msg->addr == 0x391U) || (msg->addr == 0x50CU)) {
     blended_aol_rx(msg);
   }

@@ -765,3 +765,71 @@ class IoniqAvailabilityTests(unittest.TestCase):
                                 event=sd.pm.messages['onroadEvents']))
       self.assertTrue(axis.lateralActive and command.latActive)
       self.assertFalse(state.enabled or state.active)
+
+  def test_ioniq_cold_boot_elm327_handover_avoids_controls_mismatch_while_preserving_faults(self):
+    from opendbc.car import gen_empty_fingerprint
+    from opendbc.car.hyundai.classic_scc_aol import aol_word
+    from opendbc.car.hyundai.interface import CarInterface
+    from opendbc.car.hyundai.values import CAR
+
+    fp = gen_empty_fingerprint()
+    fp[0][0x391] = 8
+    cp = CarInterface.get_params(CAR.HYUNDAI_IONIQ, fp, [], False, False, False)
+    word = aol_word(cp)
+
+    with OpenpilotPrefix():
+      sd, _, step, card, receive = self._ioniq_availability_callers(
+        full_op=False, initially_armed=False, cp=cp, cold_start=True)
+      now = 10_000_000_000
+
+      def mk_wire(model, param, *, valid=True, session_id=''):
+        msg = messaging.new_message('aolSafetyWire', 0, valid=valid, logMonoTime=now)
+        msg.aolSafetyWire = encode_safety(SafetyState(
+          1, True, now, now + 200_000_000, model, param,
+          False, False, False, False, 'authority-panda', session_id,
+        ))
+        return msg
+
+      def mk_pandas(model, param, experience, *, rx_invalid=False):
+        msg = messaging.new_message('pandaStates', 1, valid=True, logMonoTime=now)
+        p = msg.pandaStates[0]
+        p.safetyModel = model
+        p.safetyParam = param
+        p.alternativeExperience = experience
+        p.safetyRxChecksInvalid = rx_invalid
+        return msg
+
+      # Tick 0: panda is still in ELM327 mode with invalid safety wire -> commIssue only, NO controlsMismatch.
+      elm = car.CarParams.SafetyModel.elm327
+      step(0, native_valid=False,
+           panda_state_message=mk_pandas(elm, 0, 0),
+           safety_message=mk_wire(int(elm.raw), 0, valid=False))
+      self.assertIn(log.OnroadEvent.EventName.commIssue, sd.events.names)
+      self.assertNotIn(log.OnroadEvent.EventName.controlsMismatch, sd.events.names)
+
+      # Tick 1: panda switches to Hyundai AOL mode while axisSessionId handshake completes.
+      now = 10_010_000_000
+      step(1, native_valid=False,
+           panda_state_message=mk_pandas(cp.safetyConfigs[0].safetyModel, word, cp.alternativeExperience),
+           safety_message=mk_wire(int(cp.safetyConfigs[0].safetyModel.raw), word, valid=True, session_id=''))
+      self.assertNotIn(log.OnroadEvent.EventName.controlsMismatch, sd.events.names)
+
+      # Tick 2: genuine wrong safetyParam (not matching CP) MUST trigger controlsMismatch!
+      now = 10_020_000_000
+      step(2, native_valid=False,
+           panda_state_message=mk_pandas(cp.safetyConfigs[0].safetyModel, 0x2, 0),
+           safety_message=mk_wire(int(cp.safetyConfigs[0].safetyModel.raw), 0x2, valid=True, session_id=''))
+      self.assertIn(log.OnroadEvent.EventName.controlsMismatch, sd.events.names)
+      self.assertFalse(sd.aol_native_ever_seen)
+
+      # Tick 3: once handshake finishes cleanly, native_ever_seen becomes True and controlsMismatch clears.
+      now = 10_030_000_000
+      step(3, native_request_lat=False, allowed=False, native_request_long=False)
+      self.assertTrue(sd.aol_native_ever_seen)
+      self.assertNotIn(log.OnroadEvent.EventName.controlsMismatch, sd.events.names)
+
+      # Tick 4: dropping native AFTER having seen it MUST still immediately trigger controlsMismatch.
+      now = 10_040_000_000
+      step(4, native_valid=False)
+      self.assertIn(log.OnroadEvent.EventName.controlsMismatch, sd.events.names)
+

@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from collections import deque
 import csv
+from datetime import UTC, datetime
 import io
 from pathlib import Path
 import re
-import time
 from typing import Any
 
 from openpilot.starpilot.ioniq.can_signals import IoniqCanState
@@ -20,7 +20,7 @@ MAX_RECORDINGS = 60
 def build_sample(can_state: IoniqCanState, *, mono_s: float, wall_time: float | None = None,
                  extra: dict[str, Any] | None = None) -> dict[str, Any]:
   sample: dict[str, Any] = {
-    't': round(wall_time if wall_time is not None else time.time(), 3),
+    't': round(wall_time if wall_time is not None else datetime.now(UTC).timestamp(), 3),
     'monoS': round(mono_s, 3),
     'speedKph': round(can_state.best_speed_kph(), 2),
     'rpm': round(can_state.engine_rpm, 1),
@@ -108,7 +108,7 @@ class EventFlightRecorder:
                     wall_time: float | None = None, details: dict[str, Any] | None = None,
                     immediate: bool = False) -> dict | None:
     """Snapshot pre-trigger ring buffer and collect post-trigger samples (or save immediately)."""
-    now = wall_time if wall_time is not None else time.time()
+    now = wall_time if wall_time is not None else datetime.now(UTC).timestamp()
     self.record_sample(can_state, mono_s, wall_time=now, force=True)
     cutoff_mono = mono_s - self.pre_seconds
     pre_samples = [s for s in self._ring if s.get('monoS', 0.0) >= cutoff_mono]
@@ -141,7 +141,7 @@ class EventFlightRecorder:
 
   def add_event_marker(self, kind: str, message: str, *, mono_s: float, wall_time: float | None = None,
                        details: dict[str, Any] | None = None) -> None:
-    now = wall_time if wall_time is not None else time.time()
+    now = wall_time if wall_time is not None else datetime.now(UTC).timestamp()
     entry = {'t': now, 'monoS': round(mono_s, 3), 'kind': kind, 'message': message, 'details': details or {}}
     if self._pending_capture is not None:
       self._pending_capture['events'].append(entry)
@@ -150,7 +150,7 @@ class EventFlightRecorder:
 
   def start_continuous(self, label: str = 'Manuelle Vollaufzeichnung', *, mono_s: float = 0.0,
                        wall_time: float | None = None) -> dict:
-    now = wall_time if wall_time is not None else time.time()
+    now = wall_time if wall_time is not None else datetime.now(UTC).timestamp()
     if self._continuous_session is not None:
       self.stop_continuous(wall_time=now)
     self._continuous_session = {
@@ -167,7 +167,7 @@ class EventFlightRecorder:
   def stop_continuous(self, *, wall_time: float | None = None) -> dict | None:
     if self._continuous_session is None:
       return None
-    now = wall_time if wall_time is not None else time.time()
+    now = wall_time if wall_time is not None else datetime.now(UTC).timestamp()
     sess = self._continuous_session
     self._continuous_session = None
     sess['events'].append({'t': now, 'kind': 'STOP', 'message': 'Aufzeichnung beendet'})

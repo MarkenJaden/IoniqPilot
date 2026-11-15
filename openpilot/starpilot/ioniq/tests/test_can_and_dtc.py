@@ -18,7 +18,6 @@ from openpilot.starpilot.ioniq.can_signals import (
   ADDR_TCU14,
   ADDR_WHL_SPD11,
   IoniqCanState,
-  extract_intel,
 )
 from openpilot.starpilot.ioniq.dtc_catalog import analyze_dtcs, decode_dtc_bytes, decode_uds_status
 from openpilot.starpilot.ioniq.recorder import EventFlightRecorder
@@ -93,6 +92,51 @@ class MockIsoTpBus:
             seq += 1
           self._multiframe_queues[rx] = cfs
           self.inbox.append([MockFrame(rx, ff, src)])
+      elif req[:2] == b'\x19\x04':
+        # UDS 0x19 0x04 DTCSnapshotRecordByDTCNumber
+        b0, b1, ftb = req[2], req[3], req[4]
+        p = bytes([0x59, 0x04, b0, b1, ftb, 0x89, 0x01, 0x12, 0x34])
+        total = len(p)
+        ff = bytes([0x10 | ((total >> 8) & 0x0F), total & 0xFF]) + p[:6]
+        rem = p[6:]
+        self._multiframe_queues[rx] = [(bytes([0x21]) + rem).ljust(8, b'\xAA')]
+        self.inbox.append([MockFrame(rx, ff, src)])
+      elif req[:1] == b'\x01' and addr == 0x7E0 and len(req) >= 2:
+        pid = req[1]
+        if pid == 0x01:
+          p = bytes([0x41, 0x01, 0x81, 0x07, 0x25, 0x04])  # MIL ON, 1 DTC, EVAP incomplete
+        elif pid == 0x05:
+          p = bytes([0x41, 0x05, 130])  # 90 C
+        elif pid == 0x0C:
+          p = bytes([0x41, 0x0C, 0x1F, 0x40])  # 2000 rpm
+        elif pid == 0x0D:
+          p = bytes([0x41, 0x0D, 72])  # 72 km/h
+        elif pid == 0x10:
+          p = bytes([0x41, 0x10, 0x04, 0xB0])  # 12.00 g/s
+        elif pid == 0x2F:
+          p = bytes([0x41, 0x2F, 128])  # ~50.2%
+        elif pid == 0x42:
+          p = bytes([0x41, 0x42, 0x37, 0xDC])  # 14.30 V
+        elif pid == 0x5E:
+          p = bytes([0x41, 0x5E, 0x00, 0x48])  # 3.60 L/h
+        else:
+          return
+        self.inbox.append([MockFrame(rx, (bytes([len(p)]) + p).ljust(8, b'\xAA'), src)])
+      elif req[:1] == b'\x02' and addr == 0x7E0 and len(req) >= 3:
+        pid = req[1]
+        if pid == 0x02:
+          p = bytes([0x42, 0x02, 0x00, 0x03, 0x01])  # Freeze DTC P0301
+        elif pid == 0x04:
+          p = bytes([0x42, 0x04, 0x00, 128])  # ~50.2% load
+        elif pid == 0x05:
+          p = bytes([0x42, 0x05, 0x00, 125])  # 85 C
+        elif pid == 0x0C:
+          p = bytes([0x42, 0x0C, 0x00, 0x21, 0x34])  # 2125 rpm
+        elif pid == 0x0D:
+          p = bytes([0x42, 0x0D, 0x00, 84])  # 84 km/h
+        else:
+          return
+        self.inbox.append([MockFrame(rx, (bytes([len(p)]) + p).ljust(8, b'\xAA'), src)])
       elif req[:2] == b'\x22\xF1':
         did = req[2]
         if did == 0x90:
@@ -159,9 +203,50 @@ class TestCanAndDtc(unittest.TestCase):
     self.assertEqual(st.fuel_disp_level, 24)
     self.assertEqual(st.dte_km, 610)
     self.assertAlmostEqual(st.cluster_avg_fc_value or 0.0, 4.3)
+    self.assertAlmostEqual(st.cluster_avg_l_per_100km() or 0.0, 4.3)
     self.assertAlmostEqual(st.bat_12v_voltage_v or 0.0, 14.1)
     self.assertAlmostEqual(st.wheel_speed_kph, 64.0)
     self.assertEqual(st.fco_raw, 5000)
+
+    summary = st.summary()
+    self.assertEqual(summary['battery12vHealth']['status'], 'ok')
+    self.assertTrue(summary['battery12vHealth']['ldcCharging'])
+    self.assertEqual(summary['thermalStatus']['state'], 'optimal')
+
+  def test_sna_sentinel_filtering_and_passive_monitor_boot_debounce(self) -> None:
+    st = IoniqCanState()
+    # TCU14 with SNA sentinel values 0x7 on 3-bit fields and 0x3 on 2-bit fields must NOT set warning flags
+    st.apply_frame(1.0, ADDR_TCU14, encode_intel([(0, 3, 0x7), (24, 3, 0x7), (27, 2, 0x3)]))
+    self.assertEqual(st.tcu_warn_msg, 0)
+    self.assertEqual(st.tcu_dri_warn1, 0)
+    self.assertEqual(st.tcu_dri_warn2, 0)
+
+    # Real-time PassiveEcuMonitor ignores bulb-check warnings during first 8.0s after boot / ignition-on
+    mon = PassiveEcuMonitor(boot_blanking_s=8.0, debounce_s=2.5, min_samples=8)
+    st.apply_frame(1.0, ADDR_EMS11, encode_intel([(0, 1, 1), (16, 16, 4000), (48, 8, 20)]))
+    st.apply_frame(1.0, ADDR_TCU14, encode_intel([(0, 3, 2)]))
+    for step in range(15):
+      mono = 1.0 + step * 0.4  # 1.0s .. 6.6s -> inside 8.0s boot blanking window
+      self.assertEqual(mon.update(st, wall_time=1000.0 + mono, mono_s=mono), [])
+
+    # Clear before blanking ends -> never triggers a false alarm
+    st.apply_frame(8.5, ADDR_TCU14, encode_intel([(0, 3, 0)]))
+    self.assertEqual(mon.update(st, wall_time=1008.5, mono_s=8.5), [])
+
+    # Sustained fault after 8.0s blanking requires >= 2.5s and >= 8 samples before firing
+    st.apply_frame(10.0, ADDR_TCU14, encode_intel([(0, 3, 2)]))
+    fired = []
+    for step in range(10):
+      mono = 10.0 + step * 0.35
+      ev = mon.update(st, wall_time=1000.0 + mono, mono_s=mono)
+      if ev:
+        fired.extend(ev)
+    self.assertEqual(len(fired), 1)
+    self.assertEqual(fired[0]['code'], 'TCU_WARN')
+
+    mon.clear_passive_warnings()
+    self.assertEqual(mon.snapshot()['activeWarnings'], [])
+    self.assertEqual(mon.snapshot()['warningHistory'], [])
 
   def test_dtc_decoder_and_analysis(self) -> None:
     self.assertEqual(decode_dtc_bytes(0x03, 0x01), 'P0301')
@@ -172,25 +257,33 @@ class TestCanAndDtc(unittest.TestCase):
 
   def test_isotp_scan_and_clear_multi_ecu(self) -> None:
     bus = MockIsoTpBus()
-    res = scan_ioniq_ecus(bus.can_send, bus.can_recv, bus=1, timeout_s=0.15)
+    res = scan_ioniq_ecus(bus.can_send, bus.can_recv, bus=1, timeout_s=0.05)
     self.assertEqual(res['vin'], 'KMHC851CGHU000123')
     self.assertGreaterEqual(res['ecusResponded'], 6)
     codes = {d['code'] for d in res['dtcs']}
     self.assertEqual(codes, {'P0301', 'P1744', 'P0A7F', 'U0100'})
+    p0301 = next(d for d in res['dtcs'] if d['code'] == 'P0301')
+    self.assertEqual(p0301['urgency'], 'immediate')
+    self.assertTrue(len(p0301['causes']) >= 2)
+    self.assertEqual(p0301['freezeFrame']['rpm'], 2125.0)
+    self.assertEqual(p0301['snapshotHex'], '011234')
+    self.assertTrue(res['readiness']['milOn'])
+    self.assertAlmostEqual(res['obdLive']['fuelRateLph'], 3.6)
+    self.assertIn('Motorkontrollleuchte', res['analysis']['milExplanation'])
     ecm_info = next(e for e in res['ecus'] if e['ecuId'] == 'ECM')
     self.assertEqual(ecm_info['partNumber'], '39110-2B00')
     self.assertTrue(any('Hybrid' in i['title'] or 'Hochvolt' in i['title'] for i in res['analysis']['insights']))
 
     clr = clear_ioniq_dtcs(bus.can_send, bus.can_recv, target_ecu='ECM', bus=1)
     self.assertEqual(clr['clearedCount'], 1)
-    res2 = scan_ioniq_ecus(bus.can_send, bus.can_recv, bus=1, read_identities=False, timeout_s=0.15)
+    res2 = scan_ioniq_ecus(bus.can_send, bus.can_recv, bus=1, read_identities=False, timeout_s=0.05)
     codes2 = {d['code'] for d in res2['dtcs']}
     self.assertNotIn('P0301', codes2)
     self.assertIn('P1744', codes2)
 
     clr_all = clear_ioniq_dtcs(bus.can_send, bus.can_recv, target_ecu='ALL', bus=1)
     self.assertGreaterEqual(clr_all['clearedCount'], 3)
-    res3 = scan_ioniq_ecus(bus.can_send, bus.can_recv, bus=1, read_identities=False, timeout_s=0.15)
+    res3 = scan_ioniq_ecus(bus.can_send, bus.can_recv, bus=1, read_identities=False, timeout_s=0.05)
     self.assertEqual(res3['dtcs'], [])
     self.assertTrue(analyze_dtcs([])['insights'][0]['severity'] == 'ok')
 

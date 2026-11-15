@@ -27,6 +27,7 @@ from openpilot.starpilot.ioniq.uds_dtc import (
   apply_clear_result,
   apply_scan_result,
   clear_ioniq_dtcs,
+  clear_passive_warnings_state,
   queue_diagnostic_action,
   read_diagnostics_state,
   scan_ioniq_ecus,
@@ -143,6 +144,7 @@ class IoniqRuntimeController:
       fco_scale_ul=float(self.cfg.get('fcoScaleUlPerTick', 0.128)),
       calibration_factor=float(self.cfg.get('fuelCalibrationFactor', 1.0)),
       price_per_liter=float(self.cfg.get('fuelPriceEurPerLiter', 1.75)),
+      tank_capacity_liters=float(self.cfg.get('tankCapacityLiters', 45.0)),
     )
 
     self._buttons_state = read_buttons_state(self.root)
@@ -177,6 +179,7 @@ class IoniqRuntimeController:
       self.fuel.fco_scale_ul = float(self.cfg.get('fcoScaleUlPerTick', 0.128))
       self.fuel.price_per_liter = float(self.cfg.get('fuelPriceEurPerLiter', 1.75))
       self.fuel.calibration_factor = float(self.cfg.get('fuelCalibrationFactor', 1.0))
+      self.fuel.tank_capacity_liters = float(self.cfg.get('tankCapacityLiters', 45.0))
 
     btn_mtime = self._file_mtime(self.root / 'buttons.json')
     if btn_mtime != self._mtimes.get('buttons'):
@@ -192,6 +195,7 @@ class IoniqRuntimeController:
         self.root,
         fco_scale_ul=float(self.cfg.get('fcoScaleUlPerTick', 0.128)),
         price_per_liter=float(self.cfg.get('fuelPriceEurPerLiter', 1.75)),
+        tank_capacity_liters=float(self.cfg.get('tankCapacityLiters', 45.0)),
       )
       if cfg_changed or reloaded.calibration_factor == old_file_cal:
         reloaded.calibration_factor = prev_cal
@@ -234,6 +238,12 @@ class IoniqRuntimeController:
       self._mtimes['fuel'] = self._file_mtime(self.root / 'fuel.json')
     elif cmd == 'end_manual_trip':
       self.fuel.end_trip()
+      self._mtimes['fuel'] = self._file_mtime(self.root / 'fuel.json')
+    elif cmd == 'clear_passive_warnings':
+      self.monitor.clear_passive_warnings()
+      clear_passive_warnings_state(self.root)
+    elif cmd == 'reset_fuel_calibration':
+      self.fuel.reset_calibration()
       self._mtimes['fuel'] = self._file_mtime(self.root / 'fuel.json')
 
   def _persist_learn_status(self) -> None:
@@ -309,9 +319,9 @@ class IoniqRuntimeController:
       self._last_learn_sync_mono = mono_s
       self._persist_learn_status()
 
-    # Passive ECU health & event recorder triggers
+    # Passive ECU health & event recorder triggers (with boot blanking & debounce via mono_s)
     if self.cfg.get('passiveMonitorEnabled', True):
-      new_faults = self.monitor.update(self.can_state, wall_time=now)
+      new_faults = self.monitor.update(self.can_state, wall_time=now, mono_s=mono_s)
       if new_faults and self.cfg.get('recorderAutoOnFault', True):
         self.recorder.trigger_event(
           'FAULT',
@@ -355,6 +365,18 @@ class IoniqRuntimeController:
           apply_clear_result(clear_res, root=self.root)
         elif pending.get('type') == 'scan':
           scan_res = scan_ioniq_ecus(can_send, can_recv, bus=1)
+          obd_live = scan_res.get('obdLive') or {}
+          if isinstance(obd_live, dict):
+            if obd_live.get('fuelRateLph') is not None:
+              self.can_state.obd_fuel_rate_lph = float(obd_live['fuelRateLph'])
+            if obd_live.get('mafGps') is not None:
+              self.can_state.obd_maf_gps = float(obd_live['mafGps'])
+            if obd_live.get('fuelLevelPct') is not None:
+              self.can_state.obd_fuel_level_pct = float(obd_live['fuelLevelPct'])
+            if obd_live.get('coolantTempC') is not None:
+              self.can_state.obd_coolant_c = float(obd_live['coolantTempC'])
+            if obd_live.get('controlModuleV') is not None:
+              self.can_state.obd_control_module_v = float(obd_live['controlModuleV'])
           apply_scan_result(scan_res, passive_snapshot=self.monitor.snapshot(), root=self.root)
 
     return {

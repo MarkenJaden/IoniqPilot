@@ -159,15 +159,64 @@ class TestButtonAndFuel(unittest.TestCase):
 
       # Partial top-up 5L first
       tracker.log_refuel(5.0, full_tank=False, odometer_km=1400.0, wall_time=15000.0)
-      # Full tank fill 29.0L at 1720.0 km -> total 34.0L over 720km = 4.72 L/100km
-      res = tracker.log_refuel(29.0, full_tank=True, price_per_liter=1.80, odometer_km=1720.0, notes='Shell', wall_time=20000.0)
+      # Full tank fill 29.0L at 1720.0 km with total costEur=61.20 -> total 34.0L over 720km = 4.72 L/100km
+      res = tracker.log_refuel(29.0, full_tank=True, cost_eur=52.20, odometer_km=1720.0, notes='Shell', wall_time=20000.0)
       closed = res['closedTank']
       self.assertIsNotNone(closed)
       self.assertAlmostEqual(closed['actualLiters'], 34.0)
       self.assertAlmostEqual(closed['distanceKm'], 720.0)
       self.assertAlmostEqual(closed['actualLPer100Km'], 4.72)
+      self.assertIsNotNone(closed['costPer100Km'])
       self.assertGreater(res['calibrationFactor'], 1.0)
       self.assertIn('fuelLiters,avgLPer100Km', tracker.export_csv())
+
+      # Test update_refuel, delete_refuel, and reset_calibration
+      refuel_id = res['refuel']['id']
+      updated_rf = tracker.update_refuel(refuel_id, cost_eur=55.10, notes='Shell V-Power')
+      self.assertAlmostEqual(updated_rf['costEur'], 55.10)
+      self.assertEqual(updated_rf['notes'], 'Shell V-Power')
+      self.assertTrue(tracker.delete_refuel(refuel_id))
+      self.assertEqual(tracker.reset_calibration(), 1.0)
+
+  def test_fuel_nonzero_fallback_when_fco_frozen_and_volltanken_stationary_guard(self) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+      tracker = FuelTripTracker(tmp, price_per_liter=1.80)
+      st = IoniqCanState()
+
+      # Startup with fuel_disp_level jumping 0 -> 14 on first frames while moving must NOT trigger false refuelAlert
+      for i in range(60):
+        mono = float(i)
+        # Engine RPM=1800, Torque=45%, Speed=60 km/h, but FCO frozen at 0 (simulating EMS20 FCO static)
+        # Also F_N_ENG=0 and CF_Ems_EngRunNorm=0 to verify engine_is_firing() still detects RPM=1800!
+        st.apply_frame(mono, ADDR_EMS11, encode_intel([(0, 1, 1), (1, 1, 0), (16, 16, 7200), (48, 8, 60)]))
+        st.apply_frame(mono, ADDR_EMS_H12, encode_intel([(16, 8, 115), (61, 1, 0)]))
+        st.apply_frame(mono, ADDR_WHL_SPD11, encode_intel([(0, 14, 1920), (16, 14, 1920), (32, 14, 1920), (48, 14, 1920)]))
+        st.apply_frame(mono, ADDR_CLU12, encode_intel([(0, 24, 50000 + int(i * 0.16))]))
+        st.apply_frame(mono, ADDR_CLU13, encode_intel([(3, 2, 0), (6, 10, 44), (18, 5, 8), (24, 10, 210)]))
+        st.apply_frame(mono, ADDR_EMS20, encode_intel([(0, 16, 0)]))
+        tracker.update(st, mono, wall_time=20000.0 + mono)
+
+      snap = tracker.snapshot()
+      self.assertIsNone(snap['refuelAlert'])
+      self.assertIsNotNone(snap['activeTrip'])
+      self.assertGreater(snap['activeTrip']['fuelLiters'], 0.02)
+      self.assertIn(snap['activeTrip']['sourceMode'], ('torque_model', 'cluster_avg_fci'))
+
+      # Now stop the car (speed=0) for 10 seconds, then increase fuel bars from 8 -> 29 (full tank)
+      for s in range(12):
+        mono = 60.0 + float(s)
+        st.apply_frame(mono, ADDR_EMS11, encode_intel([(0, 1, 1), (16, 16, 0), (48, 8, 0)]))
+        st.apply_frame(mono, ADDR_WHL_SPD11, encode_intel([(0, 14, 0), (16, 14, 0), (32, 14, 0), (48, 14, 0)]))
+        bars = 29 if s >= 10 else 8
+        st.apply_frame(mono, ADDR_CLU13, encode_intel([(3, 2, 0), (6, 10, 44), (18, 5, bars), (24, 10, 650)]))
+        tracker.update(st, mono, wall_time=20000.0 + mono)
+
+      alert = tracker.snapshot()['refuelAlert']
+      self.assertIsNotNone(alert)
+      assert alert is not None
+      self.assertEqual(alert['deltaBars'], 21)
+      self.assertGreater(alert['estimatedAddedLiters'], 25.0)
+      self.assertTrue(alert['isLikelyFullTank'])
 
   def test_runtime_controller_and_galaxy_tools_integration(self) -> None:
     with tempfile.TemporaryDirectory() as tmp:
@@ -213,8 +262,14 @@ class TestButtonAndFuel(unittest.TestCase):
       with self.assertRaises(IoniqToolsChanged):
         tools.action({'view': page2['view'], 'action': 'clear_dtcs', 'confirmed': True, 'target': 'ALL'}, 'tok1', b'gen1')
 
-      # Startup hook executes queued OBD window scan on Hyundai
+      # Default scanOnStart is False so cold-boot does not delay Panda safety transition
       obd_states: list[bool] = []
+      self.assertIsNone(maybe_run_startup_diagnostic(
+        bus.can_recv, bus.can_send, lambda enabled: obd_states.append(enabled), brand='hyundai', root=tmp
+      ))
+      # When a scan is queued (e.g. while driving), maybe_run_startup_diagnostic executes it cleanly
+      queue_res = tools.action({'view': page2['view'], 'action': 'scan_dtcs'}, 'tok1', b'gen1')
+      self.assertTrue(queue_res['queued'])
       startup_out = maybe_run_startup_diagnostic(
         bus.can_recv, bus.can_send, lambda enabled: obd_states.append(enabled), brand='hyundai', root=tmp
       )
@@ -223,6 +278,12 @@ class TestButtonAndFuel(unittest.TestCase):
       self.assertTrue(startup_out['ranScan'])
       self.assertEqual(obd_states, [True, False])
       self.assertIsNotNone(read_diagnostics_state(tmp)['lastScan'])
+
+      # Test clear_passive_warnings action
+      current.parked = True
+      clr_warn = tools.action({'view': page2['view'], 'action': 'clear_passive_warnings'}, 'tok1', b'gen1')
+      self.assertTrue(clr_warn['saved'])
+      self.assertEqual(clr_warn['diagnostics']['passive']['activeWarnings'], [])
 
   def test_galaxy_static_fetch_contract(self) -> None:
     from pathlib import Path

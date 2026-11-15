@@ -77,6 +77,23 @@ def angle_torque_reduction_gain(steering_torque, v_ego, lat_active, last_gain):
   return round(rate_limit(target, last_gain, -0.014, 0.004) / 0.004) * 0.004
 
 
+# Automatic cruise Main standby pulse parameters for classic stock-SCC Hyundai/Kia
+AUTO_MAIN_STARTUP_FRAMES = 150       # 1.5s startup settle before attempting Main standby
+AUTO_MAIN_PULSE_FRAMES = 12          # 0.12s press duration
+AUTO_MAIN_COOLDOWN_FRAMES = 300      # 3.0s retry cooldown
+AUTO_MAIN_MAX_ATTEMPTS = 2
+
+
+def eligible_auto_cruise_main(cp):
+  return bool(
+    cp.brand == "hyundai"
+    and not cp.openpilotLongitudinalControl
+    and cp.pcmCruise
+    and not (cp.flags & (HyundaiFlags.NON_SCC | HyundaiFlags.CANFD | HyundaiFlags.LEGACY))
+    and not is_blended(cp)
+  )
+
+
 def classic_aol_dash_enabled(cp):
   return bool(cp.carFingerprint != CAR.KIA_RAY_EV and (qualified_classic_stock_aol(cp, marked_only=True) or
     cp.alternativeExperience == AOL_EXPERIENCE and qualified_classic_long_aol(cp, marked_only=True)))
@@ -180,6 +197,14 @@ class CarController(CarControllerBase):
     self._ray_lfa_icon = 0
     self._ray_prev_lat_active = False
     self._ray_disengage_frame = None
+    self.auto_cruise_main = False
+    self._auto_main_eligible = eligible_auto_cruise_main(CP)
+    self._auto_main_inhibited = False
+    self._auto_main_pulse_remaining = 0
+    self._auto_main_attempts = 0
+    self._auto_main_next_attempt_frame = AUTO_MAIN_STARTUP_FRAMES
+    self._auto_main_prev_available = False
+    self._auto_main_prev_enabled = False
 
   def update(self, CC, CS, now_nanos):
     pending_startup_required = self.pe_longitudinal is not None or self.ev9_longitudinal is not None
@@ -305,6 +330,46 @@ class CarController(CarControllerBase):
     can_sends.extend(CS.daw.command(now_nanos))
     return new_actuators, can_sends
 
+  def _update_auto_cruise_main(self, CC, CS):
+    if not self._auto_main_eligible:
+      return False
+
+    can_healthy = bool(CS.out.canValid and not CS.out.canTimeout)
+    available = bool(CS.out.cruiseState.available)
+    enabled = bool(CS.out.cruiseState.enabled)
+
+    # Observe driver overrides regardless of current toggle state so turning the
+    # toggle on later never fights an earlier manual cancel or Main off toggle.
+    if can_healthy:
+      if any(ev.type == structs.CarState.ButtonEvent.Type.cancel for ev in CS.out.buttonEvents):
+        self._auto_main_inhibited = True
+      if self._auto_main_prev_available and not available:
+        self._auto_main_inhibited = True
+      if self._auto_main_pulse_remaining == 0 and any(
+          ev.type == structs.CarState.ButtonEvent.Type.mainCruise and ev.pressed for ev in CS.out.buttonEvents):
+        if self._auto_main_prev_available:
+          self._auto_main_inhibited = True
+      self._auto_main_prev_available = available
+      self._auto_main_prev_enabled = enabled
+
+    if (not self.auto_cruise_main or self._auto_main_inhibited or not can_healthy or CS.out.accFaulted or
+        available or enabled or CC.enabled or self._ray_pedal or is_blended(self.CP) or
+        CC.cruiseControl.cancel or CC.cruiseControl.resume or
+        CS.out.brakePressed or CS.out.gasPressed):
+      self._auto_main_pulse_remaining = 0
+      return False
+
+    if self._auto_main_pulse_remaining > 0:
+      self._auto_main_pulse_remaining -= 1
+      return True
+
+    if self.frame >= self._auto_main_next_attempt_frame and self._auto_main_attempts < AUTO_MAIN_MAX_ATTEMPTS:
+      self._auto_main_attempts += 1
+      self._auto_main_pulse_remaining = AUTO_MAIN_PULSE_FRAMES - 1
+      self._auto_main_next_attempt_frame = self.frame + AUTO_MAIN_PULSE_FRAMES + AUTO_MAIN_COOLDOWN_FRAMES
+      return True
+    return False
+
   def create_can_msgs(self, apply_steer_req, apply_torque, torque_fault, set_speed_in_units, accel, stopping,
                       hud_control, actuators, CS, CC, *, lead_data=None):
     _projection = self.learning_projection_observer
@@ -358,6 +423,8 @@ class CarController(CarControllerBase):
     if self.CP.carFingerprint == CAR.KIA_RAY_EV:
       self._ray_lkas11_active = True
 
+    want_auto_main = self._update_auto_cruise_main(CC, CS)
+
     # Button messages
     if not self.CP.openpilotLongitudinalControl or self._ray_pedal:
       if self._ray_pedal and CC.enabled and CS.out.cruiseState.enabled:
@@ -373,6 +440,8 @@ class CarController(CarControllerBase):
           can_sends.extend([hyundaican.create_clu11(self.packer, self.frame, CS.clu11, Buttons.RES_ACCEL, self.CP)] * 25)
           if (self.frame - self.last_button_frame) * DT_CTRL >= 0.15:
             self.last_button_frame = self.frame
+      elif want_auto_main and bool(CS.clu11):
+        can_sends.append(hyundaican.create_clu11(self.packer, self.frame, CS.clu11, Buttons.NONE, self.CP, main_button=1))
 
     if self._ray_pedal and self.frame % 4 == 0:
       pedal_active = (CC.longActive and CS.ray_pedal_valid and CS.ray_pedal_state == 0 and

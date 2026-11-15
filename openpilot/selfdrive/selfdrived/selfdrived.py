@@ -35,7 +35,7 @@ from openpilot.system.manager.process_health import driving_process_failures
 from openpilot.selfdrive.selfdrived.state import StateMachine
 from opendbc.car.gm.aol import qualified_gm
 from openpilot.starpilot.aol.panda_faults import blocking_fault_list
-from openpilot.starpilot.aol.vehicle import native_bootstrap_supported
+from openpilot.starpilot.aol.vehicle import native_bootstrap_supported, native_matches_cp
 from opendbc.car.gm.steering_authority import monitored_profile
 from openpilot.starpilot.car.gm.steering_companion import SteeringCompanion
 from openpilot.starpilot.car.hyundai.aol import qualified_ioniq6
@@ -47,7 +47,8 @@ from openpilot.starpilot.aol.source_availability import (
   ordinary_source_availability, fresh_ordinary_lag_continuation, stock_lateral_role, stock_lateral_fault_proof,
 )
 from openpilot.starpilot.aol.runtime import (INTENT_MAX_AGE_NS, SAFETY_MAX_AGE_NS, AxisDecision, current_intent, current_native, decide_axes,
-                                            ordinary_lateral_requested, decide_ordinary_axis, known_reverse_pause)
+                                            native_inventory_matches_cp, ordinary_lateral_requested, decide_ordinary_axis, known_reverse_pause)
+from openpilot.starpilot.aol.wire import decode_safety
 from openpilot.starpilot.aol.vehicle import policy_for as axis_policy_for, ordinary_axis_request_allowed
 from openpilot.starpilot.conditional_mode.consumer import ConsumerResult, ModeConsumer
 from openpilot.starpilot.conditional_mode.effective_status import publish_ack
@@ -113,6 +114,7 @@ class SelfdriveD:
     self.aol_axis_decision = AxisDecision()
     self.aol_dm_lateral_inhibit = False
     self.aol_authority_lost = False
+    self.aol_native_ever_seen = False
     self.aol_transport_pause = TransportPause(self.CP, self.aol_session_id)
     self.aol_fault_reason = 'none'
     self.steering_authority_unavailable = False
@@ -224,6 +226,7 @@ class SelfdriveD:
     self.events = Events(event_rules(self.CP))
 
     self.initialized = False
+    self.initialized_frame = 0
     self.enabled = False
     self.active = False
     self.mismatch_counter = 0
@@ -512,7 +515,8 @@ class SelfdriveD:
         safety_mismatch = pandaState.safetyModel not in IGNORED_SAFETY_MODES
 
       # safety mismatch allows some time for pandad to set the safety mode and publish it back from panda
-      if ((safety_mismatch and self.sm.frame*DT_CTRL > 10.) or pandaState.safetyRxChecksInvalid or self.mismatch_counter >= 200 or
+      if ((safety_mismatch and (self.sm.frame - getattr(self, 'initialized_frame', 0)) * DT_CTRL > 10.) or
+          pandaState.safetyRxChecksInvalid or self.mismatch_counter >= 200 or
           (pandaState.faults and blocking_fault_list(pandaState.faults, self.CP))):
         self.events.add(EventName.controlsMismatch)
 
@@ -827,6 +831,7 @@ class SelfdriveD:
           self.state_machine.state = State.enabled
 
         self.initialized = True
+        self.initialized_frame = self.sm.frame
         cloudlog.event(
           "selfdrived.initialized",
           dt=self.sm.frame*DT_CTRL,
@@ -2036,6 +2041,48 @@ class SelfdriveD:
                 healthy_transport(self.sm, self.CP, CS, self.aol_session_id, now_ns, native))
 
 
+  def _aol_native_startup_pending(self, *, lost_active_aol=False) -> bool:
+    """Tolerate cold-boot pandad safety transition from ELM327 before native AOL handshake completes."""
+    if (getattr(self, 'aol_native_ever_seen', False) or self.enabled or self.active or
+        lost_active_aol or (self.sm.frame - getattr(self, 'initialized_frame', 0)) * DT_CTRL > 10.):
+      return False
+    pandas = self.sm['pandaStates']
+    if any(getattr(p, 'safetyRxChecksInvalid', False) or blocking_fault_list(getattr(p, 'faults', ()), self.CP)
+           for p in pandas):
+      return False
+    if not self.sm.seen['aolSafetyWire']:
+      return True
+
+    def _model_int(value) -> int:
+      return int(value.raw) if hasattr(value, 'raw') else int(value)
+
+    raw = self.sm['aolSafetyWire']
+    raw = bytes(raw) if isinstance(raw, (bytes, bytearray, memoryview)) else raw
+    wire = decode_safety(raw) if self.sm.valid['aolSafetyWire'] else None
+    elm_mode = _model_int(SafetyModel.elm327)
+    ignored_modes = tuple(_model_int(m) for m in IGNORED_SAFETY_MODES) + (elm_mode,)
+    if pandas and all(_model_int(p.safetyModel) in ignored_modes for p in pandas):
+      return wire is None or int(wire.safetyModel) in ignored_modes
+
+    configs = self.CP.safetyConfigs
+    if len(pandas) != len(configs) or not configs:
+      return False
+    for p, c in zip(pandas, configs, strict=True):
+      if (_model_int(p.safetyModel) != _model_int(c.safetyModel) or
+          int(p.safetyParam) != int(c.safetyParam) or
+          int(p.alternativeExperience) != int(self.CP.alternativeExperience)):
+        return False
+    if not self.sm.valid['aolSafetyWire']:
+      return True
+    if wire is None or int(wire.safetyModel) == elm_mode:
+      return True
+    return bool(
+      wire.compatible and int(wire.protocolVersion) == 1 and wire.pandaSerial and
+      native_matches_cp(self.CP, int(wire.safetyModel), int(wire.safetyParam)) and
+      native_inventory_matches_cp(wire, self.CP) and
+      (not wire.axisSessionId or wire.axisSessionId == getattr(self, 'aol_session_id', ''))
+    )
+
   def step(self):
     self.aol_lag_takeover_alert = False
     self.aol_soft_takeover_alert = False
@@ -2085,10 +2132,11 @@ class SelfdriveD:
         del self.aol_step_input_proof
         return
       native = current_native(self.sm, self.CP, now_ns=now_ns, axis_session_id=self.aol_session_id)
-      if native is None and self.initialized:
+      if native is not None:
+        self.aol_native_ever_seen = True
+      elif self.initialized:
         lost_active_aol = self.aol_axis_decision.lateral_active or self.aol_axis_decision.longitudinal_active
-        native_missing_at_startup = (not self.sm.seen['aolSafetyWire'] and not self.enabled and
-                                     not self.active and not lost_active_aol)
+        native_missing_at_startup = self._aol_native_startup_pending(lost_active_aol=lost_active_aol)
         self.events.add(EventName.commIssue if native_missing_at_startup else EventName.controlsMismatch)
     self.aol_decision_native = native
     if self.aol_replay:
