@@ -1023,7 +1023,7 @@ class TestBoundedInconclusiveTrialLifecycle(unittest.TestCase):
     from openpilot.starpilot.flm.offroad_processor import CompletedAssessment
     from openpilot.starpilot.flm.offroad_route import RouteReceipt
 
-    receipt = RouteReceipt('declared-inconclusive-' + digit, digit * 64, (), 'a' * 64, 1, 2, 100 + int(digit), ())
+    receipt = RouteReceipt('declared-inconclusive-' + digit, digit * 64, (), 'a' * 64, 1, 2, 100 + int(digit, 16), ())
     inventory = {'routeId': receipt.route_id}
     assessment = CompletedAssessment(receipt, (), {}, SimpleNamespace(carFingerprint='declared-unit-car'), (), inventory)
 
@@ -1038,7 +1038,7 @@ class TestBoundedInconclusiveTrialLifecycle(unittest.TestCase):
       checker=checker, scope_for=lambda cp, params: scope())
     return worker, inventory
 
-  def test_bounded_retries_keep_single_session_and_atomic_source_guards(self):
+  def test_repeated_inconclusive_drives_keep_tune_and_atomic_source_guards(self):
     from types import SimpleNamespace
     from openpilot.starpilot.flm import offroad_worker as module
     from openpilot.starpilot.flm.learned_lifecycle import decode
@@ -1048,7 +1048,7 @@ class TestBoundedInconclusiveTrialLifecycle(unittest.TestCase):
     with tempfile.TemporaryDirectory() as directory:
       params, cache, original, first_digest = self.saved_trial(directory)
       digests = []
-      for attempt, digit in enumerate('234', 1):
+      for attempt, digit in enumerate('23456789abcd', 1):
         raw = read_saved(params, KEY, MAX_BYTES)[0]
         row = decode(raw)['routeSurfaces'][scope().key()]
         digest = row['analysis_sha256']
@@ -1074,22 +1074,18 @@ class TestBoundedInconclusiveTrialLifecycle(unittest.TestCase):
         self.assertEqual(record['inconclusive_drives'], attempt)
         self.assertFalse(record['causal_road_benefit_proven'])
         self.assertEqual(cache.get(first_digest), original, 'Original qualification stays immutable')
-        if attempt < 3:
-          self.assertEqual(saved['state'], 'ready_for_next_drive')
-          self.assertEqual(saved['values'], original['values'])
-          self.assertEqual(saved['previous'], values())
-          self.assertNotEqual(saved['analysis_sha256'], digest)
-          self.assertFalse((cache.directory / ('trial-' + saved['analysis_sha256'] + '.json')).exists())
-          with patch.object(module, '_current_scope', return_value=scope()):
-            guard = from_configuration(None, params, cache.directory, vehicle_session='f' * 32)
-          self.assertIsNotNone(guard)
-          assert guard is not None
-          self.assertIsNone(guard.stopped, 'The unchanged onroad guard must load the original baseline through retry lineage')
-        else:
-          self.assertEqual(saved['state'], 'rolled_back')
-          self.assertEqual(saved['values'], values())
-          self.assertEqual(result['reason'], 'trial_inconclusive_drive_limit')
-      self.assertEqual(len(set(digests)), 3)
+        self.assertEqual(saved['state'], 'ready_for_next_drive')
+        self.assertEqual(saved['values'], original['values'])
+        self.assertEqual(saved['previous'], values())
+        self.assertNotEqual(saved['analysis_sha256'], digest)
+        self.assertEqual(record['trial_analysis_sha256'], first_digest, 'Retained trials keep constant-depth provenance')
+        self.assertFalse((cache.directory / ('trial-' + saved['analysis_sha256'] + '.json')).exists())
+        with patch.object(module, '_current_scope', return_value=scope()):
+          guard = from_configuration(None, params, cache.directory, vehicle_session='f' * 32)
+        self.assertIsNotNone(guard)
+        assert guard is not None
+        self.assertIsNone(guard.stopped, 'Fresh controllers must load the original baseline after every pending drive')
+      self.assertEqual(len(set(digests)), 12)
 
   def test_pending_store_rejects_stale_bytes_unauthorized_and_repeated_drives(self):
     from openpilot.starpilot.flm.learned_lifecycle import decode
@@ -1527,12 +1523,67 @@ class TestLatestUsefulDriveReport(unittest.TestCase):
     self.assertFalse(details['Earlier analysis shown while updating'])
     self.assertFalse(wire['current']['application']['applied'])
 
-  def test_new_useful_drive_without_suggestions_is_not_replaced_by_a_more_positive_report(self):
+  def test_new_useful_drive_keeps_its_measurements_and_recent_compatible_suggestions(self):
     self.latest['analysis_counts']['qualified_whole_windows'] = 4
     result = self.report()
     self.assertEqual(result['completed_route'], self.latest['completed_route'])
-    self.assertEqual(result['recommendations'], [])
+    self.assertEqual(result['analysis_counts'], self.latest['analysis_counts'])
+    self.assertEqual(result['recommendations'], self.driving['recommendations'])
+    self.assertEqual(result['recommendation_sources'], [[r['parameter'], self.driving['completed_route']] for r in result['recommendations']])
     self.assertNotIn('latest_recording', result)
+
+  def test_trial_rollback_does_not_erase_other_provisional_findings(self):
+    self.latest.update(status='rolled_back', reason='trial_inconclusive_drive_limit', configuration_changed=True,
+                       configuration_state='rolled_back', configured_values=values(), saved_adjustments=0)
+    result = self.report()
+    for key in ('status', 'reason', 'configuration_changed', 'configuration_state', 'configured_values', 'saved_adjustments'):
+      self.assertEqual(result[key], self.latest[key])
+    self.assertEqual(len(result['recommendations']), 5)
+    self.assertFalse(result['actual_application_proven'])
+
+  def test_findings_accumulate_across_recent_drives_without_inflating_evidence(self):
+    self.latest['recommendations'] = [{'parameter': 'ff_gain_right', 'baseline': 0, 'target': -.005,
+                                      'whole_windows': 3, 'reason': 'recorded_candidate_requires_automatic_checks'}]
+    self.latest['analysis_counts']['qualified_whole_windows'] = 4
+    self.parked['recommendations'] = list(self.driving['recommendations'])
+    result = self.report()
+    self.assertEqual(len(result['recommendations']), 6)
+    self.assertEqual(result['recommendation_count'], 6)
+    self.assertEqual(result['analysis_counts'], self.latest['analysis_counts'])
+    self.assertEqual(result['recommendations'][0]['whole_windows'], 3)
+    self.assertTrue(all(r['whole_windows'] == 6 for r in result['recommendations'][1:]))
+    self.assertEqual(dict(result['recommendation_sources'])['unwind_taper_right'], self.driving['completed_route'])
+
+  def test_conflicting_or_refused_findings_do_not_resurrect_older_suggestions(self):
+    self.latest['analysis_counts']['qualified_whole_windows'] = 4
+    for reason in ('conflicting_recorded_candidates', 'heldout_profile_does_not_support_training_step',
+                   'controller_checks_did_not_support_change'):
+      with self.subTest(reason=reason):
+        self.latest['recommendations'] = [dict(self.driving['recommendations'][0], target=None, reason=reason)]
+        self.assertNotIn('unwind_taper_right', [r['parameter'] for r in self.report()['recommendations']])
+    self.latest['recommendations'] = [dict(self.driving['recommendations'][1], target=-.005)]
+    self.assertNotIn('friction_threshold_low', [r['parameter'] for r in self.report()['recommendations']])
+
+  def test_old_targets_do_not_override_a_later_saved_setting(self):
+    self.latest.update(configuration_state='ready_for_next_drive', configured_values=dict.fromkeys(ROUTE_NAMES, .005), saved_adjustments=35)
+    self.latest['analysis_counts']['qualified_whole_windows'] = 4
+    self.assertEqual(self.report()['recommendations'], [])
+
+  def test_partial_findings_stay_partial_and_never_supply_trial_or_saved_state(self):
+    document = self.cache.get(self.driving['assessment_sha256'])
+    document['assessment']['route'].update(last_intact_wall_ns=document['assessment']['route']['completed_wall_ns'], completed_wall_ns=0)
+    self.driving.update(assessment_sha256=self.cache.put(dict(document, kind='partial_assessment')), partial_drive=True,
+                        configuration_changed=True, configuration_state='ready_for_next_drive', saved_adjustments=5)
+    self.latest['analysis_counts']['qualified_whole_windows'] = 4
+    result = self.report()
+    self.assertEqual(len(result['recommendations']), 5)
+    self.assertTrue(all(r['reason'] == 'partial_drive_provisional_only' for r in result['recommendations']))
+    self.assertEqual(result['saved_adjustments'], 0)
+    self.assertFalse(result['configuration_changed'])
+    self.assertNotIn('partial_drive', result)
+    self.assertNotIn('configuration_state', result)
+    self.driving.pop('partial_drive')
+    self.assertEqual(self.report()['recommendations'], [])
 
   def test_different_vehicle_controller_baseline_epoch_or_reset_does_not_supply_findings(self):
     from dataclasses import replace
@@ -1608,7 +1659,7 @@ class TestLatestUsefulDriveReport(unittest.TestCase):
     self.report()
     status.restore(self.cache)
     self.assertEqual(status.previous['completed_route'], self.latest['completed_route'])
-    self.assertEqual(status.previous['recommendations'], [])
+    self.assertEqual(status.previous['recommendations'], self.driving['recommendations'])
 
 
 

@@ -22,7 +22,7 @@ const hints = [['highway_center_taper_max', .005], ['friction_threshold_low', .0
   ['friction_threshold_mid', .004], ['friction_threshold_fast', .005], ['friction_threshold_highway', .006]]
 function report() {
   if (scenario === 'empty') return { version: 1, history: [], current: null }
-  const saved = scenario === 'saved' || scenario === 'saved-retained' || scenario === 'applied'
+  const saved = ['saved', 'saved-retained', 'inconclusive', 'neutral-reviewed', 'applied'].includes(scenario)
   const application = scenario === 'applied'
   const rows = SURFACE_NAMES.map(name => [name, saved && name === 'highway_center_taper_max' ? .005 : 0])
   const start = 1_000_000_000, points = Array.from({ length: 24 }, (_, i) =>
@@ -42,6 +42,16 @@ function report() {
           sampling: 'input_ordered_original_endpoints_no_interpolation', points } } } }
   if (saved) Object.assign(value.current.details, { 'Saved route configuration state': 'ready_for_next_drive',
     'Full surface coordinates': rows, 'Saved friction-curve adjustments': FRICTION_NAMES.map(name => [name, 0]) })
+  if (scenario === 'inconclusive') {
+    value.current.reason = 'trial_measurement_inconclusive'
+    value.current.details['Analysis decision'] = value.current.reason
+    value.current.details['Automatic configuration changed'] = false
+  }
+  if (scenario === 'neutral-reviewed') {
+    value.current.status = 'retained_after_drive';value.current.reason = 'independent_actual_tracking_stable'
+    Object.assign(value.current.details, { 'Analysis decision': value.current.reason,
+      'Saved route configuration state': 'retained_after_drive', 'Automatic configuration changed': false })
+  }
   if (application) value.current.details['Actual full surface coordinates'] = rows
   if (scenario === 'stale') { value.current.fresh = false; value.current.ageSeconds = 20 }
   if (scenario === 'retained' || scenario === 'saved-retained') {
@@ -57,6 +67,17 @@ function report() {
     value.current.details['Recorded coordinate recommendations'][0][0] = 'unwind_taper_right'
   }
   if (scenario === 'rollback') value.current.details['Saved route configuration state'] = 'rolled_back'
+  if (scenario === 'recent-rollback') {
+    value.current.status = 'rolled_back';value.current.reason = 'trial_inconclusive_drive_limit'
+    Object.assign(value.current.details, { 'Analysis decision': value.current.reason, 'Saved route configuration state': 'rolled_back',
+      'Recorded steering response': null, 'Full surface coordinates': rows,
+      'Saved friction-curve adjustments': FRICTION_NAMES.map(name => [name, 0]) })
+    const recent = [['ff_gain_right', -.005], ['turn_in_boost_right', .005], ['unwind_taper_right', .005],
+      ['unwind_taper_left', .005], ['center_taper_max', .006], ['center_deadband_fast_deg', .006], ...hints.slice(1)]
+    value.current.details['Recorded coordinate recommendations'] = recent.map(([name, target], i) =>
+      [name, 0, target, i < 3 ? 10 : 24, i < 3 ? 'partial_drive_provisional_only' : 'recorded_candidate_requires_automatic_checks'])
+    value.current.details['Recorded suggestion sources'] = recent.map(([name], i) => [name, i < 3 ? 'earlier-partial-drive' : 'earlier-completed-drive'])
+  }
   if (scenario === 'incomplete') delete value.current.details['Recorded steering observations']
   if (scenario === 'unknown-change') value.current.details['Automatic configuration changed'] = true
   assert(validTrainingResults(value), 'Browser fixtures must pass the real report validator')
@@ -255,8 +276,25 @@ try {
     }
   }
   await viewport(416);await execute('document.documentElement.dataset.theme="dark"')
-  for (const name of ['none', 'empty', 'saved', 'rollback', 'conflict', 'contradictory', 'stale', 'retained', 'earlier-drive', 'wrong-car', 'incomplete', 'unknown-change']) {
+  for (const name of ['none', 'empty', 'saved', 'inconclusive', 'neutral-reviewed', 'rollback', 'recent-rollback', 'conflict', 'contradictory', 'stale', 'retained', 'earlier-drive', 'wrong-car', 'incomplete', 'unknown-change']) {
     await change(name);await layout(`state/${name}`);await capture(name)
+    if (name === 'neutral-reviewed') {
+      assert(await execute('return window.flm.review.title === "Your learned tune is saved" && window.flm.offroad.savedCount === 1'))
+      assert(await execute('return !window.flm.report.current.application.applied && !window.flm.offroad.saved'))
+      assert(await execute('return !/improv|uncertain|not proven/i.test(window.flm.review.description)'))
+      checks.push('neutral-review/saved-values-without-new-adjustment-or-benefit-claim')
+    }
+    if (name === 'inconclusive') {
+      assert.equal(await execute('return window.flm.offroad.savedValues.highway_center_taper_max'), .005)
+      assert.equal(await execute('return window.flm.currentApplied'), false)
+      const copy = await execute('return document.querySelector(".gx-tuner__drive-copy").innerText')
+      assert(copy.includes('Auto Learn saved a tune') && copy.includes('1 saved'))
+      assert(!copy.includes('not proven') && !copy.includes('not sure') && !copy.includes('restored'))
+      assert(await execute('return document.body.innerText.includes("Your saved adjustments are ready for your next drive.")'))
+      await show('.gx-tuner__overview-grid > section:last-child')
+      await capture('inconclusive-next-drive')
+      checks.push('inconclusive-keeps-saved-values-without-fabricated-application')
+    }
     if (name === 'retained') assert(await execute('return !/Refresh|Reconnect/.test(window.flm.review.description)&&window.flm.review.description.includes("saved tune")'))
     if (name === 'earlier-drive') {
       assert(await execute('return window.flm.offroad.earlierDrive && !window.flm.offroad.retained && !window.flm.review.historical'))
@@ -278,6 +316,20 @@ try {
     }
     if (name === 'stale') assert(await execute('return !/Refresh|Reconnect/.test(window.flm.review.description)&&window.flm.savedSummary==="0 saved"'))
     if (name === 'saved') assert.equal(await execute('return window.flm.currentApplied'), false)
+    if (name === 'recent-rollback') {
+      assert.equal(await execute('return window.flm.review.title'), 'Your previous tune was restored')
+      assert.equal(await execute('return window.flm.review.count'), 10)
+      assert.equal(await execute('return window.flm.currentApplied'), false)
+      const writes = requests.length
+      await click('[data-action=view-findings]')
+      assert(await execute('return window.flm.review.manual.length===6 && window.flm.review.curve.length===4'))
+      assert(await execute('return document.querySelector(".gx-tuner__findings").textContent.includes("SUGGESTIONS FROM RECENT DRIVING")'))
+      assert(await execute('return document.querySelector(".gx-tuner__idea-grid").textContent.includes("earlier drive with the same setup")'))
+      assert(await execute('return document.querySelector(".gx-tuner__idea-grid").textContent.includes("incomplete recording")'))
+      assert.equal(requests.length, writes, 'Reviewing retained suggestions must not write a tune')
+      await capture('rollback-ten-recent-findings')
+      checks.push('rollback/ten-source-bound-recent-findings/no-write')
+    }
     if (name === 'conflict') { assert.equal(await execute('return window.flm.review.count'), 4);assert(await execute('return !window.flm.review.findings.some(row=>row.target===null)')) }
     if (name === 'contradictory') {
       assert.equal(await execute('return window.flm.review.count'), 1)
