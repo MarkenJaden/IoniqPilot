@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { formatDuration, formatNum, IoniqToolsPage } from '../web/js/ioniq-tools.js'
+import { GxState } from '../web/js/state.js'
 
 test('ioniq-tools formatting helpers format values cleanly', () => {
   assert.equal(formatDuration(45), '45s')
@@ -66,4 +67,35 @@ test('IoniqToolsPage loads local dashboard and submits action cleanly', async ()
   assert.equal(requests[1].url, './api/ioniq-tools/action')
   assert.equal(requests[1].body.action, 'scan_dtcs')
   assert.equal(requests[1].body.view, 'view-token-1')
+})
+
+test('IoniqToolsPage exposes standalone Tools layout and handles mode transitions', () => {
+  assert.equal(IoniqToolsPage.components.GxState, GxState)
+  assert.match(IoniqToolsPage.template, /<h2>Ioniq Diagnostics &amp; Fuel<\/h2>/)
+  assert.match(IoniqToolsPage.template, /Ioniq Diagnostics &amp; Fuel requires the device\. No operation was attempted\./)
+  assert.match(IoniqToolsPage.template, /title="Hyundai Ioniq required"/)
+  assert.match(IoniqToolsPage.template, /<GxNotice v-if="state\.error" tone="danger">/)
+
+  let loads = 0
+  let aborted = 0
+  const ctx = {
+    mode: 'sample',
+    alive: false,
+    generation: 0,
+    controller: { abort() { aborted++ } },
+    timer: null,
+    load() { loads++ },
+  }
+  IoniqToolsPage.mounted.call(ctx)
+  assert.equal(ctx.alive, false)
+  assert.equal(loads, 0)
+
+  IoniqToolsPage.watch.mode.call(ctx, 'local')
+  assert.equal(ctx.alive, true)
+  assert.equal(loads, 1)
+
+  IoniqToolsPage.watch.mode.call(ctx, 'sample')
+  assert.equal(ctx.alive, false)
+  assert.equal(aborted, 1)
+  assert.equal(ctx.generation, 1)
 })

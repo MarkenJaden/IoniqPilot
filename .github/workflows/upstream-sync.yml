@@ -43,9 +43,11 @@ jobs:
         openpilot/starpilot/galaxy/server.py
         openpilot/starpilot/galaxy/http_server.py
         openpilot/system/manager/process_config.py
+        openpilot/system/manager/process_health.py
         openpilot/selfdrive/car/card.py &&
         (! command -v node >/dev/null || node --test
         openpilot/starpilot/galaxy/tests/test_ioniq_tools.mjs
+        openpilot/starpilot/galaxy/tests/test_vehicle_controls.mjs
         openpilot/starpilot/galaxy/tests/test_ui_templates.mjs
         openpilot/starpilot/galaxy/tests/test_cloud_provider.mjs
         openpilot/starpilot/galaxy/tests/test_catalog_startup.mjs)

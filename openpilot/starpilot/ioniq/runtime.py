@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
-import os
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
+import logging
+import signal
+import threading
 import time
-from typing import Any, Callable
+from typing import Any, NamedTuple
 
 from openpilot.starpilot.ioniq.button_learner import (
   ButtonLearnEngine,
@@ -23,12 +27,38 @@ from openpilot.starpilot.ioniq.uds_dtc import (
   apply_clear_result,
   apply_scan_result,
   clear_ioniq_dtcs,
-  diagnostics_path,
   queue_diagnostic_action,
   read_diagnostics_state,
   scan_ioniq_ecus,
   write_diagnostics_state,
 )
+
+
+def _utc_timestamp() -> float:
+  return datetime.now(UTC).timestamp()
+
+
+class _CanFrame(NamedTuple):
+  address: int
+  dat: bytes
+  src: int
+
+
+def can_comm_callbacks(logcan: Any, sendcan: Any) -> tuple[Callable[..., list[list[_CanFrame]]], Callable[[list[Any]], None]]:
+  """Build CAN send/recv callbacks without importing openpilot.selfdrive.car.card."""
+  from openpilot.cereal import messaging
+  from openpilot.selfdrive.pandad import can_list_to_can_capnp
+
+  def can_recv(wait_for_one: bool = False) -> list[list[_CanFrame]]:
+    ret: list[list[_CanFrame]] = []
+    for can in messaging.drain_sock(logcan, wait_for_one=wait_for_one):
+      ret.append([_CanFrame(int(msg.address), bytes(msg.dat), int(msg.src)) for msg in can.can])
+    return ret
+
+  def can_send(msgs: list[Any]) -> None:
+    sendcan.send(can_list_to_can_capnp(msgs, msgtype='sendcan'))
+
+  return can_recv, can_send
 
 
 def commands_path(root: Path | str | None = None) -> Path:
@@ -42,7 +72,8 @@ def push_runtime_command(command: str, args: dict[str, Any] | None = None,
   queue = read_json(path, [])
   if not isinstance(queue, list):
     queue = []
-  item = {'id': f'cmd_{int(time.time() * 1000)}_{len(queue)}', 'command': command, 'args': args or {}, 'createdAt': time.time()}
+  now = _utc_timestamp()
+  item = {'id': f'cmd_{int(now * 1000)}_{len(queue)}', 'command': command, 'args': args or {}, 'createdAt': now}
   queue.append(item)
   write_json_atomic(path, queue[-16:])
   return item
@@ -135,14 +166,17 @@ class IoniqRuntimeController:
     self._mtimes['commands'] = self._file_mtime(commands_path(self.root))
 
   def _reload_external_changes(self, mono_s: float) -> None:
+    cfg_changed = False
     cfg_mtime = self._file_mtime(self.root / 'config.json')
     if cfg_mtime != self._mtimes.get('config'):
+      cfg_changed = True
       self._mtimes['config'] = cfg_mtime
       self.cfg = read_config(self.root)
       self.recorder.pre_seconds = float(self.cfg.get('recorderPreSeconds', 30.0))
       self.recorder.post_seconds = float(self.cfg.get('recorderPostSeconds', 10.0))
       self.fuel.fco_scale_ul = float(self.cfg.get('fcoScaleUlPerTick', 0.128))
       self.fuel.price_per_liter = float(self.cfg.get('fuelPriceEurPerLiter', 1.75))
+      self.fuel.calibration_factor = float(self.cfg.get('fuelCalibrationFactor', 1.0))
 
     btn_mtime = self._file_mtime(self.root / 'buttons.json')
     if btn_mtime != self._mtimes.get('buttons'):
@@ -152,11 +186,16 @@ class IoniqRuntimeController:
     fuel_mtime = self._file_mtime(self.root / 'fuel.json')
     if fuel_mtime != self._mtimes.get('fuel'):
       self._mtimes['fuel'] = fuel_mtime
-      self.fuel = FuelTripTracker(
+      prev_cal = self.fuel.calibration_factor
+      old_file_cal = self.fuel.state.get('calibrationFactor')
+      reloaded = FuelTripTracker(
         self.root,
         fco_scale_ul=float(self.cfg.get('fcoScaleUlPerTick', 0.128)),
         price_per_liter=float(self.cfg.get('fuelPriceEurPerLiter', 1.75)),
       )
+      if cfg_changed or reloaded.calibration_factor == old_file_cal:
+        reloaded.calibration_factor = prev_cal
+      self.fuel = reloaded
 
     cmd_path = commands_path(self.root)
     cmd_mtime = self._file_mtime(cmd_path)
@@ -237,7 +276,7 @@ class IoniqRuntimeController:
     can_recv: Callable[..., list[Any]] | None = None,
   ) -> dict[str, Any]:
     """Process a batch of CAN frames `(bus, address, data)` plus peripheral state."""
-    now = wall_time if wall_time is not None else time.time()
+    now = wall_time if wall_time is not None else _utc_timestamp()
     if (mono_s - self._last_sync_mono) >= 0.4:
       self._last_sync_mono = mono_s
       self._reload_external_changes(mono_s)
@@ -331,11 +370,10 @@ class IoniqRuntimeController:
     self.fuel.flush(0.0)
 
 
-def main() -> None:
-  from cereal import messaging
+def _default_runtime_setup() -> tuple[Any, ...]:
+  from openpilot.cereal import messaging
   from openpilot.common.params import Params
   from openpilot.common.realtime import Ratekeeper
-  from openpilot.selfdrive.car.card import can_comm_callbacks
 
   params = Params()
   controller = IoniqRuntimeController(params_obj=params)
@@ -344,38 +382,100 @@ def main() -> None:
   can_recv, can_send = can_comm_callbacks(can_sock, sendcan)
   sm = messaging.SubMaster(['deviceState', 'carState', 'pandaStates'])
   rk = Ratekeeper(20, print_delay_threshold=None)
+  return controller, messaging, can_sock, sm, can_recv, can_send, rk
+
+
+def _get_cloudlog() -> Any:
+  try:
+    from openpilot.common.swaglog import cloudlog
+    return cloudlog
+  except Exception:
+    return logging.getLogger('ioniqd')
+
+
+def main(
+  stop_event: threading.Event | None = None,
+  *,
+  startup_delay_s: float = 2.0,
+  setup_fn: Callable[[], tuple[Any, ...]] | None = None,
+) -> None:
+  cloudlog = _get_cloudlog()
+
+  stop = stop_event or threading.Event()
+  prev_handlers: dict[signal.Signals, Any] = {}
+  if threading.current_thread() is threading.main_thread():
+    def _handle_stop(_signum: int, _frame: Any) -> None:
+      stop.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+      prev_handlers[sig] = signal.getsignal(sig)
+      signal.signal(sig, _handle_stop)
+
+  init_runtime = setup_fn or _default_runtime_setup
+  controller: Any = None
+  backoff_s = 1.0
 
   try:
-    while True:
-      sm.update(0)
-      can_pkts = messaging.drain_sock(can_sock)
-      frames: list[tuple[int, int, bytes]] = []
-      for pkt in can_pkts:
-        for msg in pkt.can:
-          frames.append((int(msg.src), int(msg.address), bytes(msg.dat)))
+    # Let core Openpilot daemons initialize first before bringing up optional Ioniq telemetry.
+    if startup_delay_s > 0.0 and stop.wait(startup_delay_s):
+      return
 
-      ign_hint = bool(sm['deviceState'].started) if sm.alive['deviceState'] else None
-      elm_active = False
-      if sm.alive['pandaStates'] and len(sm['pandaStates']) > 0:
-        try:
-          elm_active = str(sm['pandaStates'][0].safetyModel) == 'elm327'
-        except Exception:
-          elm_active = False
+    while not stop.is_set():
+      try:
+        controller, messaging_mod, can_sock, sm, can_recv, can_send, rk = init_runtime()
+        backoff_s = 1.0
+        break
+      except Exception:
+        cloudlog.exception(f'ioniqd initialization failed; retrying in {backoff_s:.1f}s')
+        if stop.wait(backoff_s):
+          return
+        backoff_s = min(backoff_s * 2.0, 30.0)
 
-      controller.step(
-        frames,
-        mono_s=time.monotonic(),
-        wall_time=time.time(),
-        ignition_hint=ign_hint,
-        elm327_active=elm_active,
-        can_send=can_send if elm_active else None,
-        can_recv=can_recv if elm_active else None,
-      )
-      rk.keep_time()
+    while not stop.is_set():
+      try:
+        sm.update(0)
+        can_pkts = messaging_mod.drain_sock(can_sock)
+        frames: list[tuple[int, int, bytes]] = []
+        for pkt in can_pkts:
+          for msg in pkt.can:
+            frames.append((int(msg.src), int(msg.address), bytes(msg.dat)))
+
+        ign_hint = bool(sm['deviceState'].started) if sm.alive['deviceState'] else None
+        elm_active = False
+        if sm.alive['pandaStates'] and len(sm['pandaStates']) > 0:
+          try:
+            elm_active = str(sm['pandaStates'][0].safetyModel) == 'elm327'
+          except Exception:
+            elm_active = False
+
+        controller.step(
+          frames,
+          mono_s=time.monotonic(),
+          wall_time=_utc_timestamp(),
+          ignition_hint=ign_hint,
+          elm327_active=elm_active,
+          can_send=can_send if elm_active else None,
+          can_recv=can_recv if elm_active else None,
+        )
+        backoff_s = 1.0
+        rk.keep_time()
+      except KeyboardInterrupt:
+        stop.set()
+      except Exception:
+        cloudlog.exception(f'ioniqd step failed; retrying in {backoff_s:.1f}s')
+        if stop.wait(backoff_s):
+          break
+        backoff_s = min(backoff_s * 2.0, 30.0)
   except KeyboardInterrupt:
     pass
   finally:
-    controller.shutdown()
+    for sig, prev in prev_handlers.items():
+      signal.signal(sig, prev)
+    if controller is not None:
+      try:
+        controller.shutdown()
+      except Exception:
+        cloudlog.exception('ioniqd shutdown failed')
 
 
 if __name__ == '__main__':

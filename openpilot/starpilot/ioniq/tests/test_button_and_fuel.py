@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from openpilot.starpilot.galaxy.ioniq_tools import IoniqTools, IoniqToolsChanged
 from openpilot.starpilot.ioniq.button_learner import ButtonLearnEngine, ButtonMatcher, execute_button_action
@@ -70,7 +71,7 @@ class TestButtonAndFuel(unittest.TestCase):
     self.assertEqual(learner.state, 'listening')
 
     # Perform 3 crisp presses on byte 2 bit 0x04 while byte 7 counter keeps changing constantly
-    for press_i in range(3):
+    for _press_i in range(3):
       # Press down
       for _ in range(3):
         learner.feed_frame(t, 0, 0x50C, bytes([0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, counter & 0x0F]))
@@ -230,6 +231,180 @@ class TestButtonAndFuel(unittest.TestCase):
     scripts = '\n'.join(p.read_text(encoding='utf-8') for p in web_js.glob('*.js'))
     found = sorted(re.findall(r"\bfetch\s*\(\s*[\"']([^\"']+)", scripts))
     self.assertEqual(found, ['./api/auth/session', './api/drive-state/action', './api/drive-state/status', '/_gateway/devices'])
+
+  def test_ioniqd_health_isolation_and_process_config_ordering(self) -> None:
+    import ast
+    from pathlib import Path
+    from openpilot.system.manager.process_health import ANCILLARY_PROCESSES, driving_process_failures
+
+    self.assertIn('ioniqd', ANCILLARY_PROCESSES)
+    self.assertEqual(
+      driving_process_failures([
+        SimpleNamespace(name='ioniqd', running=False, shouldBeRunning=True),
+        SimpleNamespace(name='controlsd', running=True, shouldBeRunning=True),
+      ]),
+      set(),
+    )
+    self.assertEqual(
+      driving_process_failures([
+        SimpleNamespace(name='ioniqd', running=False, shouldBeRunning=True),
+        SimpleNamespace(name='controlsd', running=False, shouldBeRunning=True),
+      ]),
+      {'controlsd'},
+    )
+
+    proc_cfg_path = Path(__file__).resolve().parents[3] / 'system/manager/process_config.py'
+    tree = ast.parse(proc_cfg_path.read_text(encoding='utf-8'))
+    procs_node = next(
+      node.value for node in tree.body
+      if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'procs' for t in node.targets)
+    )
+    assert isinstance(procs_node, ast.List)
+    proc_names: list[str] = []
+    ioniqd_call: ast.Call | None = None
+    for elt in procs_node.elts:
+      if isinstance(elt, ast.Call) and elt.args and isinstance(elt.args[0], ast.Constant) and isinstance(elt.args[0].value, str):
+        proc_names.append(elt.args[0].value)
+        if elt.args[0].value == 'ioniqd':
+          ioniqd_call = elt
+
+    self.assertIsNotNone(ioniqd_call)
+    assert ioniqd_call is not None
+    self.assertEqual(ast.literal_eval(ioniqd_call.args[1]), 'openpilot.starpilot.ioniq.runtime')
+    restart_kw = next((kw for kw in ioniqd_call.keywords if kw.arg == 'restart_on_exit'), None)
+    self.assertIsNotNone(restart_kw)
+    assert restart_kw is not None
+    self.assertIs(ast.literal_eval(restart_kw.value), True)
+    self.assertGreater(proc_names.index('ioniqd'), proc_names.index('uploader'))
+    self.assertLess(proc_names.index('ioniqd'), proc_names.index('webrtcd'))
+
+  def test_runtime_imports_and_can_frame_capnp_compatibility(self) -> None:
+    import ast
+    from pathlib import Path
+    from openpilot.starpilot.ioniq import runtime, uds_dtc
+
+    src = Path(runtime.__file__).read_text(encoding='utf-8')
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+      if isinstance(node, ast.ImportFrom):
+        self.assertNotEqual(node.module, 'cereal')
+        self.assertNotEqual(node.module, 'openpilot.selfdrive.car.card')
+      elif isinstance(node, ast.Import):
+        for alias in node.names:
+          self.assertNotEqual(alias.name, 'cereal')
+          self.assertNotEqual(alias.name, 'openpilot.selfdrive.car.card')
+
+    msg1 = uds_dtc._make_can_msg(0x7E0, b'\x02\x19\x02\x00\x00\x00\x00\x00', 1)
+    msg2 = runtime._CanFrame(0x7E0, b'\x11\x22', 1)
+    for msg in (msg1, msg2):
+      self.assertEqual(msg[0], msg.address)
+      self.assertEqual(msg[1], msg.dat)
+      self.assertEqual(msg[2], msg.src)
+
+  def test_runtime_main_startup_delay_and_backoff_recovery(self) -> None:
+    import threading
+    from openpilot.starpilot.ioniq import runtime
+
+    class _RecordingStop:
+      def __init__(self, *, cancel_on_delay: bool = False) -> None:
+        self._set = False
+        self.cancel_on_delay = cancel_on_delay
+        self.waits: list[float] = []
+
+      def is_set(self) -> bool:
+        return self._set
+
+      def set(self) -> None:
+        self._set = True
+
+      def wait(self, timeout: float = 0.0) -> bool:
+        self.waits.append(timeout)
+        if self.cancel_on_delay:
+          self._set = True
+        return self._set
+
+    setup_calls = 0
+
+    def _never_called():
+      nonlocal setup_calls
+      setup_calls += 1
+      raise AssertionError('setup_fn must not run when stopped during startup delay')
+
+    canceled_stop = _RecordingStop(cancel_on_delay=True)
+    runtime.main(stop_event=canceled_stop, startup_delay_s=2.0, setup_fn=_never_called)  # type: ignore[arg-type]
+    self.assertEqual(setup_calls, 0)
+    self.assertEqual(canceled_stop.waits, [2.0])
+
+    # Now verify recovery from setup failures (1s -> 2s backoff) and loop step error (1s backoff -> clean shutdown).
+    recovery_stop = _RecordingStop()
+    steps = {'init': 0, 'tick': 0, 'shutdown': 0}
+
+    class _FakeController:
+      def step(self, *args, **kwargs):
+        steps['tick'] += 1
+        if steps['tick'] == 1:
+          raise RuntimeError('transient tick failure')
+        recovery_stop.set()
+
+      def shutdown(self):
+        steps['shutdown'] += 1
+
+    class _FakeSm:
+      alive = {'deviceState': False, 'pandaStates': False}
+
+      def update(self, _timeout: int = 0) -> None:
+        pass
+
+      def __getitem__(self, _key: str):
+        return None
+
+    def _flaky_setup():
+      steps['init'] += 1
+      if steps['init'] <= 2:
+        raise RuntimeError(f'init failure {steps["init"]}')
+      return (
+        _FakeController(),
+        SimpleNamespace(drain_sock=lambda _sock: []),
+        object(),
+        _FakeSm(),
+        lambda _wait=False: [],
+        lambda _msgs: None,
+        SimpleNamespace(keep_time=lambda: None),
+      )
+
+    logged_errors: list[str] = []
+    with patch.object(runtime, '_get_cloudlog', return_value=SimpleNamespace(exception=lambda msg: logged_errors.append(str(msg)))):
+      runtime.main(stop_event=recovery_stop, startup_delay_s=2.0, setup_fn=_flaky_setup)  # type: ignore[arg-type]
+    self.assertEqual(steps['init'], 3)
+    self.assertEqual(steps['tick'], 2)
+    self.assertEqual(steps['shutdown'], 1)
+    self.assertEqual(len(logged_errors), 3)
+    # 2.0 startup wait + 1.0, 2.0 init failure waits + 1.0 step failure wait
+    self.assertEqual(recovery_stop.waits, [2.0, 1.0, 2.0, 1.0])
+
+    # Real threading.Event exit path also returns promptly
+    real_stop = threading.Event()
+    real_stop.set()
+    runtime.main(stop_event=real_stop, startup_delay_s=5.0, setup_fn=_never_called)
+
+  def test_runtime_controller_reload_updates_fuel_calibration(self) -> None:
+    from openpilot.starpilot.ioniq.storage import read_config, write_config
+
+    with tempfile.TemporaryDirectory() as tmp:
+      params = MemoryParams()
+      ctrl = IoniqRuntimeController(root=tmp, params_obj=params)
+      self.assertAlmostEqual(ctrl.fuel.calibration_factor, 1.0)
+
+      cfg = read_config(tmp)
+      cfg['fuelCalibrationFactor'] = 1.08
+      write_config(cfg, tmp)
+      ctrl.step([], mono_s=1.0, wall_time=200.0)
+      self.assertAlmostEqual(ctrl.fuel.calibration_factor, 1.08)
+
+      # Updating fuel.json without changing its calibration keeps config.json calibration intact
+      ctrl.fuel.flush(0.0)
+      ctrl.step([], mono_s=2.0, wall_time=201.0)
+      self.assertAlmostEqual(ctrl.fuel.calibration_factor, 1.08)
 
 
 if __name__ == '__main__':

@@ -199,3 +199,16 @@ assert.equal(leftVehicle, 1)
 let cancelled = 0
 assert.equal(VehicleControlsPage.methods.navigateBack.call({ state: { pending: {} }, feed: { cancel: () => cancelled++ } }), true)
 assert.equal(cancelled, 1)
+assert.equal(VehicleControlsPage.components.IoniqToolsPage, undefined)
+assert.ok(!VehicleControlsPage.template.includes("IoniqToolsPage"))
+const ioniqCatalogEntry = catalog.tools.find(tool => tool.path === "/ioniq")
+assert.deepEqual(ioniqCatalogEntry, {
+  name: "Ioniq Diagnostics & Fuel",
+  path: "/ioniq",
+  icon: "bi-ev-front",
+  description: "Fuel consumption, tank cycles, ECU fault codes (DTC), 3x button learning and event recorder",
+  availability: "local-only",
+})
+assert.match(app, /route\.path === '\/ioniq'/)
+assert.match(app, /<IoniqToolsPage\b/)
+

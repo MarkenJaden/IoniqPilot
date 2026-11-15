@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 import time
-from typing import Any, Callable
+from typing import Any, NamedTuple
 
 from openpilot.starpilot.ioniq.can_signals import IoniqCanState
 from openpilot.starpilot.ioniq.dtc_catalog import analyze_dtcs, decode_dtc_bytes, enrich_dtc_record
 from openpilot.starpilot.ioniq.storage import ioniq_storage_root, read_json, write_json_atomic
+
+
+def _utc_timestamp() -> float:
+  return datetime.now(UTC).timestamp()
 
 
 @dataclass(frozen=True)
@@ -45,15 +51,14 @@ ECU_BY_RX: dict[int, EcuTarget] = {ecu.rx_addr: ecu for ecu in IONIQ_ECUS}
 ECU_BY_ID: dict[str, EcuTarget] = {ecu.ecu_id: ecu for ecu in IONIQ_ECUS}
 
 
-def _make_can_msg(address: int, data: bytes, bus: int) -> Any:
-  return _CanFrame(address=address, dat=data, src=bus)
-
-
-@dataclass
-class _CanFrame:
+class _CanFrame(NamedTuple):
   address: int
   dat: bytes
   src: int
+
+
+def _make_can_msg(address: int, data: bytes, bus: int) -> Any:
+  return _CanFrame(address=address, dat=data, src=bus)
 
 
 def _iter_can_frames(packets: Any):
@@ -73,9 +78,9 @@ def _iter_can_frames(packets: Any):
 
 
 def _extract_frame(msg: Any) -> tuple[int, bytes, int]:
-  addr = int(getattr(msg, 'address'))
-  dat = bytes(getattr(msg, 'dat'))
-  src = int(getattr(msg, 'src'))
+  addr = int(msg.address)
+  dat = bytes(msg.dat)
+  src = int(msg.src)
   return addr, dat, src
 
 
@@ -206,7 +211,7 @@ def scan_ioniq_ecus(
   clock: Callable[[], float] = time.monotonic,
 ) -> dict:
   """Scan all Ioniq AE HEV ECUs for UDS/OBD-II DTCs and ECU metadata."""
-  started_at = time.time()
+  started_at = _utc_timestamp()
   ecu_statuses: list[dict] = []
   dtcs: list[dict] = []
   seen_dtc_keys: set[tuple[str, str, str]] = set()
@@ -327,7 +332,7 @@ def clear_ioniq_dtcs(
           cleared.append({'ecuId': ecu.ecu_id, 'status': 'cleared_obd04'})
 
   return {
-    'clearedAt': time.time(),
+    'clearedAt': _utc_timestamp(),
     'target': target_ecu.upper(),
     'clearedCount': len(cleared),
     'cleared': cleared,
@@ -345,7 +350,7 @@ class PassiveEcuMonitor:
 
   def update(self, can_state: IoniqCanState, wall_time: float | None = None) -> list[dict]:
     """Compare current CAN flags with previous state and return newly raised fault events."""
-    now = wall_time if wall_time is not None else time.time()
+    now = wall_time if wall_time is not None else _utc_timestamp()
     detected: dict[str, tuple[str, str, str]] = {}
 
     if can_state.mil_lamp:
@@ -436,7 +441,7 @@ def queue_diagnostic_action(action_type: str, target: str = 'ALL', root: Path | 
   state['pendingAction'] = {
     'type': action_type,
     'target': target.upper(),
-    'requestedAt': time.time(),
+    'requestedAt': _utc_timestamp(),
   }
   return write_diagnostics_state(state, root)
 

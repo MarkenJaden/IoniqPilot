@@ -15,10 +15,11 @@
      - Continuous ring-buffer + fault/manual event flight recorder (JSON + CSV export under `starpilot_storage_root() / 'ioniq' / 'recordings'`).
      - 3x-press passive CAN button learning & debounced action dispatcher.
      - Fuel consumption (`EMS20.FCO` + Kappa 1.6 GDi torque/RPM model + `CLU13` cross-check), Ignition-to-Ignition trips, and Tank-to-Tank ("Volltanken zu Volltanken") pump calibration.
-   - `openpilot/system/manager/process_config.py`: `PythonProcess("ioniqd", "openpilot.starpilot.ioniq.runtime", always_run, enabled=not PC)`.
+   - `openpilot/system/manager/process_config.py`: `PythonProcess("ioniqd", "openpilot.starpilot.ioniq.runtime", always_run, enabled=not PC, restart_on_exit=True)` (ordered after core Openpilot processes).
+   - `openpilot/system/manager/process_health.py`: Lists `'ioniqd'` in `ANCILLARY_PROCESSES` so `ioniqd` startup/restarts never block Openpilot engagement or trigger `processNotRunning`.
    - `openpilot/selfdrive/car/card.py`: Calls `maybe_run_startup_diagnostic(...)` during Hyundai startup OBD window before `FirmwareQueryDone` is published.
    - `openpilot/starpilot/galaxy/ioniq_tools.py`, `openpilot/starpilot/galaxy/server.py`, `openpilot/starpilot/galaxy/http_server.py`: `/api/ioniq-tools` and `/api/ioniq-tools/action` endpoints & `ioniq_tools_source` cleanup.
-   - `openpilot/starpilot/galaxy/web/js/ioniq-tools.js` & `openpilot/starpilot/galaxy/web/js/vehicle-controls.js`: `<IoniqToolsPage>` UI inside Vehicle Controls.
+   - `openpilot/starpilot/galaxy/web/js/ioniq-tools.js`, `openpilot/starpilot/galaxy/web/data/catalog.json`, `openpilot/starpilot/galaxy/web/js/app.js`: Standalone `<IoniqToolsPage>` under Galaxy **Tools** (`/ioniq`).
    - **Prebuilt `Dom` Storage Invariant**: All custom Ioniq persistent state lives in JSON under `starpilot_storage_root() / 'ioniq'`, NEVER adding new keys to `openpilot/common/params_keys.h` unless `libparams_c.so` is rebuilt too.
 
 3. **Merged Upstream Feature Branches (Also kept intact as separate PR branches)**
@@ -28,5 +29,5 @@
 ## Merge Conflict Policy
 
 - Preserve all files in `openpilot/starpilot/ioniq/`, `openpilot/starpilot/galaxy/ioniq_tools.py`, `openpilot/starpilot/galaxy/web/js/ioniq-tools.js`, `openpilot/starpilot/galaxy/tests/test_ioniq_tools.mjs`, `.github/workflows/upstream-sync.yml`, and `FORK_DIVERGENCES.md`.
-- In `server.py`, `http_server.py`, `vehicle-controls.js`, `process_config.py`, and `card.py`, accept upstream improvements while keeping the small `ioniq_*` / `IoniqToolsPage` hooks intact.
-- Respect Galaxy static preview contract (`openpilot/starpilot/galaxy/tests/test_preview_contract.py`): keep `web/data/catalog.json` tool paths and literal `fetch("...")` allowlist untouched.
+- In `server.py`, `http_server.py`, `app.js`, `catalog.json`, `process_health.py`, `process_config.py`, and `card.py`, accept upstream improvements while keeping the small `ioniq_*` / `IoniqToolsPage` / `ioniqd` hooks intact.
+- Respect Galaxy static preview contract (`openpilot/starpilot/galaxy/tests/test_preview_contract.py`): keep `web/data/catalog.json` `/ioniq` entry and literal `fetch("...")` allowlist aligned.

@@ -46,6 +46,13 @@
       "availability": "local-only"
     },
     {
+      "name": "Ioniq Diagnostics & Fuel",
+      "path": "/ioniq",
+      "icon": "bi-ev-front",
+      "description": "Fuel consumption, tank cycles, ECU fault codes (DTC), 3x button learning and event recorder",
+      "availability": "local-only"
+    },
+    {
       "name": "Logs & Diagnostics",
       "path": "/logs",
       "icon": "bi-exclamation-triangle",
