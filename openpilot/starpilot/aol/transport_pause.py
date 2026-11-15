@@ -1,5 +1,6 @@
 """Reason-qualified intent retention; this module never grants an axis."""
 from openpilot.cereal import log
+from openpilot.starpilot.aol.transport_pause_session import TransportPause as TransportPause
 from openpilot.starpilot.aol.panda_faults import blocking_fault_mask, blocking_fault_list
 from openpilot.starpilot.aol.runtime import AXIS_MAX_AGE_NS, SAFETY_MAX_AGE_NS, current_native, native_inventory_matches_cp
 from openpilot.starpilot.aol.wire import SafetyState, decode_intent
@@ -215,56 +216,6 @@ class AvailabilityPause:
       return False
 
 
-class TransportPause:
-  def __init__(self, cp, session):
-    self.cp = cp_identity(cp)
-    self.session = session
-    self.active = False
-    self.producer = ''
-    self.epoch = None
-
-  def observe(self, *, cp, session, sm, cs, native, now_ns, companion, previous_intent,
-              intent, expired_healthy_source, previously_active, hard_fault, model_ready, user_disable):
-    self.observed_native = None
-    context_current = bool(cp_identity(cp) == self.cp and session == self.session and model_ready and companion is not None)
-    if context_current:
-      self.observed_native = _healthy_transport_native(sm, cp, cs, session, now_ns, native)
-      if self.observed_native is None and cp.brand == 'ford':
-        from openpilot.starpilot.car.ford.gas_override import healthy_gas_transport_native
-        self.observed_native = healthy_gas_transport_native(sm, cp, cs, session, now_ns)
-    eligible = bool(context_current and not hard_fault and self.observed_native is not None)
-    latest = companion.latest if companion is not None else None
-    raw = decode_intent(sm['aolIntentWire']) if sm.seen.get('aolIntentWire', False) else None
-    previous = previous_intent
-    producer = self.producer if self.active else str(previous.producerSessionId) if previous is not None else ''
-    eligible = bool(eligible and latest is not None and latest[1] and raw is not None and
-      sm.valid['aolIntentWire'] and sm.alive['aolIntentWire'] and
-      raw.settingsQualified and raw.producerSessionId == producer and
-      latest[2].producerSessionId == producer and
-      int(sm.logMonoTime['aolIntentWire']) == raw.carStateLogMonoTime and
-      0 < raw.carStateLogMonoTime <= now_ns and raw.observedMonoTime <= now_ns and
-      (self.epoch is None or self.epoch == companion.integrity_epoch))
-    if self.active:
-      if not eligible:
-        self.active = False
-        return False, True
-      if user_disable or intent is not None and not intent.allowedLatch:
-        self.active = False
-        self.epoch = companion.integrity_epoch
-        return False, False
-      return True, False
-    if (eligible and expired_healthy_source and previously_active and previous is not None and
-        previous.allowedLatch and previous.lateralArmed and raw.allowedLatch and raw.lateralArmed and
-        not user_disable):
-      self.active = True
-      self.producer = producer
-      self.epoch = companion.integrity_epoch
-      return True, False
-    if intent is not None and companion is not None:
-      self.epoch = companion.integrity_epoch
-    return False, False
-
-
 class TransportPauseFeedback:
   """Card accepts pause provenance only after a healthy same-session baseline."""
   def __init__(self, cp):
@@ -281,6 +232,7 @@ class TransportPauseFeedback:
     self.ever_lateral_active = False
     self.lag_withdrawal_ns = 0
     self.cold_main_wait_ns = 0
+    self.cold_main_source_ns = 0
     self.cold_main_sparse_waiting = False
     self.ccnc_main_off_source_ns = 0
     self.cold_park_waiting = False
@@ -1474,6 +1426,8 @@ class TransportPauseFeedback:
             producer=intent_producer_session):
           self.session = str(axis.sessionId)
           self.sequence, self.signature = int(axis.sequence), signature
+          if axis.sourceCarStateMonoTime > 0:
+            self.cold_main_source_ns = int(axis.sourceCarStateMonoTime)
           event_ns = int(sm.logMonoTime['onroadEvents'])
           if not self.cold_main_wait_ns:
             self.cold_main_wait_ns = event_ns
@@ -1496,9 +1450,12 @@ class TransportPauseFeedback:
             axis.faultEventMonoTime == event_ns and sm.seen['onroadEvents'] and
             sm.valid['onroadEvents'] and sm.alive['onroadEvents'] and 0 < event_ns <= stamp and
             now_ns - event_ns <= AXIS_MAX_AGE_NS and
+            (axis.sourceCarStateMonoTime != 0 or not (cp.pcmCruise and not cp.openpilotLongitudinalControl) or
+             0 < self.cold_main_source_ns <= stamp <= now_ns <= self.cold_main_source_ns + SAFETY_MAX_AGE_NS) and
             cold_main_readiness(cp, cs, native, sm['onroadEvents'], recovering=recovering)):
           if recovering:
             self.cold_main_wait_ns = 0
+            self.cold_main_source_ns = 0
             self.cold_main_sparse_waiting = False
           else:
             self.cold_main_wait_ns = event_ns
@@ -1734,6 +1691,7 @@ class TransportPauseFeedback:
       if current and baseline and not latched:
         # Healthy idle ends cold MAIN recovery; cleared wait cannot block requests.
         self.cold_main_wait_ns = 0
+        self.cold_main_source_ns = 0
         self.cold_main_sparse_waiting = False
         self.cold_park_waiting = False
         self.temporary_eps_event_ns = 0
@@ -1832,6 +1790,7 @@ class TransportPauseFeedback:
           self.subaru_eps_brake_event_ns = 0
           self.lag_withdrawal_ns = 0
           self.cold_main_wait_ns = 0
+          self.cold_main_source_ns = 0
           self.cold_main_sparse_waiting = False
           self.cold_park_waiting = False
           self.temporary_eps_event_ns = 0

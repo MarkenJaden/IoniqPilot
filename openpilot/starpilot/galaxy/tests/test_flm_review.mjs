@@ -35,6 +35,12 @@ assert.match(ideaExplanation({ target: null }), /did not support the same change
 assert.match(ideaExplanation(route.suggestions[1]), /more evidence/)
 assert.equal(reviewModel({ ...route, suggestions: [] }).count, 0)
 assert.equal(reviewModel(null).count, 0)
+const failedReview = FlmPage.computed.review.call({ offroad: route, current: { status: 'unavailable', reason: 'Assessment cache full' } })
+assert.equal(failedReview.title, 'Drive review could not finish')
+assert.match(failedReview.description, /latest analysis could not be saved/)
+assert.doesNotMatch(failedReview.description, /No new change was saved/)
+assert.match(FlmPage.template, /Latest review incomplete/)
+assert.match(FlmPage.template, /v-if="!bluetooth"[^>]*href="\.\/api\/flm\/logs\/download"/)
 assert.equal(reviewModel({ ...route, configurationState: 'ready_for_next_drive' }).tone, 'saved')
 assert.equal(reviewModel({ ...route, configurationState: 'rolled_back' }).title, 'Your previous tune was restored')
 assert.equal(reviewModel({ ...route, saved: true }).title, 'A configuration change was reported')
@@ -124,6 +130,21 @@ assert.equal(context.review.curve.length, 5)
 for (const group of context.navigationGroups) assert(context.groupHasIdeas(group))
 assert.equal(context.navigationGroups.reduce((sum, group) => sum + offroadView(data).suggestions.filter(row => group.names.includes(row.parameter)).length, 0), 35)
 assert.equal(context.currentApplied, false)
+const mixed = structuredClone(data)
+mixed.current.details['Recorded coordinate recommendations'] = [
+  ['turn_in_boost_left', 0, .005, 6, 'independent_support_for_frozen_training_profile'],
+  ['friction_threshold_low', 0, .002, 6, 'training_candidate_not_independently_confirmed'],
+  ['unwind_taper_right', 0, null, 6, 'conflicting_recorded_candidates'],
+  ['ff_gain_right', 0, .005, 6, 'controller_checks_did_not_support_change'],
+]
+assert(validTrainingResults(mixed))
+const mixedReview = reviewModel(offroadView(mixed))
+assert.equal(mixedReview.count, 2, 'Supported and provisional neighbors survive a rejected bundled profile')
+assert.equal(mixedReview.manual.length, 1)
+assert.equal(mixedReview.curve.length, 1)
+assert.equal(ideaStatus(mixedReview.manual[0]), 'Repeated finding')
+assert.equal(ideaStatus(mixedReview.curve[0]), 'Possible change')
+assert.equal(offroadView(mixed).saved, false)
 const rendered = compile(FlmPage.template, { decodeEntities: value => value.replaceAll('&amp;', '&') })
 const walk = node => Array.isArray(node) ? node.flatMap(walk) : node && typeof node === 'object' ? [node, ...walk(node.children)] : []
 context.view = 'tune'
@@ -154,3 +175,17 @@ context.report.current.ageSeconds = 0
 context.now = context.receivedAt
 assert.equal(JSON.stringify(context.review), beforeExpiry)
 assert.equal(context.currentApplied, false)
+
+const partialReview = reviewModel({ ...route, partial: true, partialSegments: [9,10],
+  configurationState: 'ready_for_next_drive', savedValues: { friction_threshold_low: .002 },
+  suggestions: [ { ...idea('highway_center_taper_max'), reason: 'partial_drive_provisional_only' } ] })
+assert.equal(partialReview.count,1)
+assert.match(partialReview.title,/Part of/)
+assert.match(partialReview.description,/9 of 10/)
+assert.match(partialReview.description,/stayed the same/)
+assert.match(partialReview.next,/will not change your tune automatically/)
+const partialEmpty = reviewModel({ ...route, partial: true, partialSegments: [8,10], suggestions: [] })
+assert.equal(partialEmpty.count,0)
+assert.match(partialEmpty.next,/No supported suggestion/)
+assert.equal(ideaStatus({reason:'partial_drive_provisional_only'}),'Partial-drive suggestion')
+assert.match(ideaExplanation({ ...idea('highway_center_taper_max'), reason:'partial_drive_provisional_only' }),/will not save it automatically/)

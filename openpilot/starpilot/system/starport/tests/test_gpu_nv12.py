@@ -58,6 +58,14 @@ def gpu():
         rl.rlgl_close()
         gl.CGLSetCurrentContext(None)
         gl.CGLDestroyContext(context)
+    elif os.getenv("STARPILOT_TEST_SOFTWARE_EGL") == "1":
+      from openpilot.starpilot.system.starport.tests.software_egl import SoftwareEGLContext
+      context = SoftwareEGLContext(rl)
+      # The wheel bundles Mesa; the host's GLES library may use a separate
+      # dispatch table and cannot read framebuffers from this EGL context.
+      load_library = C.CDLL
+      patch.setattr(headless_egl.C, "CDLL", lambda name: context.gl if name == "libGLESv2.so" else load_library(name))
+      close = context.close
     else:
       context = headless_egl.HeadlessContext(64, 64)
       close = context.close

@@ -79,6 +79,7 @@ def fit_independent_route(assessment, group, cohort, prior, proposal, previous, 
     or not 6 <= len(validation) <= 12
     or len(set(train + validation)) != len(train + validation)
     or assessment.receipt.source_sha256 == prior.receipt.source_sha256
+    or {row[1] for row in assessment.receipt.segments}.intersection(row[1] for row in prior.receipt.segments)
     or assessment.receipt.route_id == prior.receipt.route_id
     or prior.receipt.completed_wall_ns >= assessment.receipt.completed_wall_ns
     or prior.receipt.cp_sha256 != assessment.receipt.cp_sha256
@@ -219,6 +220,10 @@ def _release_unused_analysis_heap():
 
 
 def _original_results(assessment, original, ids, values, root, *, permitted, source_batch=False):
+  from openpilot.starpilot.flm.offroad_route import PartialRouteReceipt
+
+  if type(getattr(assessment, 'receipt', None)) is PartialRouteReceipt:
+    raise ValueError('Partial reviews cannot qualify a tune or resolve a trial')
   permitted = route_permission(permitted)
   try:
     return _read_original_results(assessment, original, ids, values, root, permitted=permitted, source_batch=source_batch)

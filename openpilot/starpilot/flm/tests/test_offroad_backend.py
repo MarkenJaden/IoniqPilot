@@ -98,7 +98,7 @@ class TestOffroadCache(unittest.TestCase):
     for session in ('', 'e' * 31, 'z' * 32):
       with self.subTest(session=session), self.assertRaises(ValueError):
         self.cache.claim_trial('d' * 64, session)
-    with patch('openpilot.starpilot.flm.offroad_cache.MAX_FILES', 0), self.assertRaises(ValueError):
+    with patch('openpilot.starpilot.flm.offroad_cache.MAX_TOTAL', 0), self.assertRaises(ValueError):
       self.cache.claim_trial('e' * 64, 'f' * 32)
     self.cache.directory.chmod(0o777)
     with self.assertRaises(ValueError):
@@ -1794,7 +1794,9 @@ class TestOffroadTrackingPolicy(unittest.TestCase):
       stable_windows={metadata_key: profile, other_key: wrong_map},
     )
     route = {'routeId': prior_id, 'segments': [{'files': {'rlog': True}} for _ in range(8)]}
-    assessment = SimpleNamespace(receipt=SimpleNamespace(route_id=current_id, cp_sha256='a' * 64, completed_wall_ns=10))
+    assessment = SimpleNamespace(receipt=SimpleNamespace(
+      route_id=current_id, cp_sha256='a' * 64, completed_wall_ns=10, segments=((current_id + '--0', 'c' * 64, 1),),
+    ))
     with (
       patch.object(module, 'route_inventory', return_value={'scanIncomplete': False, 'routes': [route]}),
       patch.object(module, 'collect_route_inputs', return_value=collected),
