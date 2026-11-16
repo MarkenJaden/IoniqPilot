@@ -8,7 +8,7 @@ from openpilot.starpilot.flm.offroad_analysis import analyze, MAX_WINDOWS, cohor
 from openpilot.starpilot.flm.offroad_baseline_windows import baseline_windows
 from openpilot.starpilot.flm.canonical_surface_adapter import NAMES as AMPLITUDE_NAMES
 from openpilot.starpilot.flm.offroad_residual import analyze_stable_windows
-from openpilot.starpilot.flm.offroad_evidence import read_point, whole_windows, eligible_points, tracking_metrics
+from openpilot.starpilot.flm.offroad_evidence import read_point, whole_windows, eligible_points, tracking_metrics, window_demand
 from openpilot.starpilot.flm.offroad_route import (
   latest_route, walk_completed_route, RouteInputCancelled, RouteReceipt, SelectedSourceReceipt, PartialRouteReceipt, route_permission,
 )
@@ -57,24 +57,6 @@ class CompletedAssessment:
     }
 
 
-def window_demand(window):
-  import math
-
-  points = window.points
-  rms = math.sqrt(sum(p.desired**2 for p in points) / len(points))
-  return {
-    'domain': window.domain,
-    'duration_ns': points[-1].mono_ns - points[0].mono_ns,
-    'speed_low': min(p.speed_mps for p in points),
-    'speed_high': max(p.speed_mps for p in points),
-    'goal_rms': rms,
-    'goal_shape': [
-      sum(p.desired for p in points[i * len(points) // 8 : (i + 1) * len(points) // 8]) / len(points[i * len(points) // 8 : (i + 1) * len(points) // 8]) / rms
-      if rms > 0
-      else 0.0
-      for i in range(8)
-    ],
-  }
 
 
 def _separate_qualification(report, continuous, *, proposal_windows=None, route_order=None, role_windows=None):
@@ -438,14 +420,7 @@ def collect_latest_steering_inputs(params, root, *, permitted, selected_route=No
   def allowed():
     return permitted() and time.monotonic() - started <= MAX_ANALYSIS_SECONDS
 
-  def walk(actual_root, original_route, *, permitted, consume):
-    if len(original_route.get('segments', ())) <= 30:
-      return walk_completed_route(actual_root, original_route, permitted=permitted, consume=consume)
-    from openpilot.starpilot.flm.offroad_prior_inputs import _selected_sources
-
-    return _selected_sources(actual_root, original_route, permitted=permitted, consume=consume, cp_sha256=None)
-
-  collected = collect_route_inputs(root, route, permitted=allowed, walker=walk)
+  collected = collect_route_inputs(root, route, permitted=allowed)
   current_cp = collected.receipt.cp_sha256
   skipped = 0
 
@@ -470,7 +445,7 @@ def collect_latest_steering_inputs(params, root, *, permitted, selected_route=No
       from openpilot.starpilot.flm.offroad_route import RouteInputError
 
       try:
-        earlier = collect_route_inputs(root, candidate, permitted=allowed, walker=walk)
+        earlier = collect_route_inputs(root, candidate, permitted=allowed)
       except RouteInputError as error:
         import logging
 

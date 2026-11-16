@@ -17,6 +17,10 @@ const targetIndex = SURFACE_NAMES.indexOf('highway_center_taper_max')
 const running = child => child.exitCode === null && child.signalCode === null
 assert.equal(running({ exitCode: null, signalCode: 'SIGTERM' }), false, 'A signal-reaped child must not be awaited for a second exit')
 let scenario = 'ideas', parked = true, saveError = false, reportError = false, pending = null
+let backupReject = false, backupRecovery = false, manualRecovered = false
+const tuneBackup = { format: 'starpilot-flm-tune', version: 1, vehicle: 'DECLARED_UI_CAR', metric: false,
+  controllerMode: 'starpilot', cpSha256: 'a'.repeat(64), createdAt: '2026-11-16T03:00:00Z', checksum: 'declared-ui-checksum',
+  manual: [{ page: 'tuning', key: 'torque:surface:highway_center_taper_max', value: '0.5' }], learned: {} }
 const manual = Object.fromEntries(SURFACE_NAMES.map(name => [name, 0]))
 const hints = [['highway_center_taper_max', .005], ['friction_threshold_low', .002],
   ['friction_threshold_mid', .004], ['friction_threshold_fast', .005], ['friction_threshold_highway', .006]]
@@ -80,6 +84,13 @@ function report() {
   }
   if (scenario === 'incomplete') delete value.current.details['Recorded steering observations']
   if (scenario === 'unknown-change') value.current.details['Automatic configuration changed'] = true
+  if (scenario.startsWith('earlier-saved')) {
+    value.savedHistory = { status: 'readable', historicalOnly: true, profiles: [{ completedAt: 1794777785171,
+      state: 'ready_for_next_drive', values: [['friction_threshold_mid', .0036], ['friction_threshold_fast', .0048], ['friction_threshold_highway', .0048]] }] }
+    value.current.details['Saved route adjustment count'] = null
+    if (scenario === 'earlier-saved-no-report') value.current = null
+  }
+  if (scenario === 'history-unavailable') value.savedHistory = { status: 'unavailable', historicalOnly: true, profiles: [] }
   assert(validTrainingResults(value), 'Browser fixtures must pass the real report validator')
   return value
 }
@@ -91,6 +102,9 @@ function settings() {
         'Shapes small steering corrections at this stage. Higher and lower values change the controller response. Parked only. Manual overrides pause Auto Learn.',
       value: manual[coordinate].toFixed(4), minimum: -25, maximum: 25, step: .25, unit: '%', defaultValue: 0,
       resetAvailable: parked, available: parked, action: true })),
+    ...(manualRecovered ? ['crawl','low','mid','fast','highway'].map((speed, index) => ({ coordinate: 'friction_threshold_' + speed,
+      label: 'Recovered speed correction', value: [0,0,.36,.48,.48][index].toFixed(4), unit: '%', available: false, action: false,
+      reason: 'Saved by explicit manual recovery. Auto Learn is paused.' })) : []),
     { label: 'Reset all manual overrides', reason: 'Remove the thirty manual overrides.', value: 'Reset', confirm: true, available: parked, action: true }] }
 }
 const stylesheetLinks = [...(await readFile(join(root, 'index.html'), 'utf8')).matchAll(/<link[^>]*rel="stylesheet"[^>]*>/g)].map(row => row[0].replaceAll('href="./', 'href="/')).join('\n')
@@ -113,11 +127,25 @@ const server = createServer(async (req, res) => {
     if (pathname === '/api/plots/live') return json({ schemaVersion: 1, sessionId: '0000000000000001', state: 'unavailable', sampleIndex: 0, sampleAgeSeconds: null, error: 'Declared parked fixture', bootStabilizing: false, values: null })
     if (pathname === '/api/device/state') return json({ state: parked ? 'parked' : 'driving', maxAgeMs: 3000 })
     if (pathname === '/api/flm/training-results') return json(reportError ? { error: 'Declared connection error' } : report(), reportError ? 503 : 200)
+    if (pathname === '/api/flm/backup') return json(tuneBackup)
     if (pathname === '/api/settings/pages/tuning') return json(settings())
     if (pathname.startsWith('/api/settings/')) {
       let raw = ''; for await (const chunk of req) raw += chunk
       const body = JSON.parse(raw); requests.push({ path: pathname, body })
       if (!parked || saveError) return json({ error: 'Declared save refusal' }, 503)
+      if (pathname === '/api/settings/flm-backup/preview') {
+        backupRecovery = body.mode === 'recovery'
+        return backupReject ? json({ error: 'No Auto Learn setup matches the current controller.' }, 409) :
+          json({ intent: 'declared-backup-intent', question: backupRecovery ? 'Recover these values as your manual tune? Auto Learn pauses until you reset the manual tune.' :
+            'Restore these manual slider values? Manual overrides pause Auto Learn.', count: 1,
+            changes: [['Highway center taper', '0', '0.5']] })
+      }
+      if (pathname === '/api/settings/flm-backup/confirm') {
+        assert.equal(body.intent, 'declared-backup-intent');assert.equal(body.confirmed, true)
+        manual.highway_center_taper_max = .5
+        if (backupRecovery) manualRecovered = true
+        return json({ complete: true, restored: 1, manual: backupRecovery, unchanged: 0, skipped: [] })
+      }
       if (pathname.endsWith('/preview') || pathname.endsWith('/reset-default')) {
         pending = { intent: 'declared-intent-' + requests.length, row: body.row, value: pathname.endsWith('/reset-default') ? 0 : body.value }
         return json({ ...pending, question: 'Remove the thirty manual overrides?', proposed: body.value === undefined ? 'Reset' : body.value })
@@ -247,6 +275,11 @@ try {
       assert.equal(await execute('return document.querySelectorAll(".gx-tuner__groups>button").length'), 7)
       assert.equal(await execute('return document.querySelectorAll(".gx-tuner__idea-grid .gx-tuner__idea").length'), 1)
       assert.equal(await execute('return document.querySelectorAll(".gx-tuner__curve-summary [data-coordinate]").length'), 4)
+      assert(await execute(`const saved=document.querySelector('[aria-labelledby="tuner-saved-title"]'),suggestions=document.querySelector('[aria-labelledby="tuner-suggestions-title"]'),heading=document.querySelector('#tuner-suggestions-title');
+        return saved.nextElementSibling===suggestions&&saved.textContent.includes('No saved adjustments reported.')&&saved.querySelector('h3').textContent==='Auto-learned settings'&&
+          heading.textContent==='Suggestions · needs more evidence'&&saved.getBoundingClientRect().bottom<suggestions.getBoundingClientRect().top&&
+          [...suggestions.querySelectorAll('.gx-tuner__idea')].every(e=>Boolean(heading.compareDocumentPosition(e)&Node.DOCUMENT_POSITION_FOLLOWING))`), 'One suggestions heading separates every steering and speed finding from the auto-learned settings')
+      checks.push(`${width}/${theme}/saved-and-suggestion-section-boundary`)
       await layout(`${width}/${theme}/ideas`)
       if (width === 1280) assert(await execute('const a=document.querySelector(".gx-tuner__idea-grid").getBoundingClientRect(),b=document.querySelector(".gx-tuner__curve-summary").getBoundingClientRect();return Math.abs(a.top-b.top)<1&&a.right<b.left'), 'Desktop groups related findings side by side without overlapping')
       if (width === 320 || width === 416 || width === 1280) {
@@ -276,7 +309,7 @@ try {
     }
   }
   await viewport(416);await execute('document.documentElement.dataset.theme="dark"')
-  for (const name of ['none', 'empty', 'saved', 'inconclusive', 'neutral-reviewed', 'rollback', 'recent-rollback', 'conflict', 'contradictory', 'stale', 'retained', 'earlier-drive', 'wrong-car', 'incomplete', 'unknown-change']) {
+  for (const name of ['none', 'empty', 'saved', 'inconclusive', 'neutral-reviewed', 'rollback', 'recent-rollback', 'conflict', 'contradictory', 'stale', 'retained', 'earlier-drive', 'wrong-car', 'incomplete', 'unknown-change', 'earlier-saved', 'earlier-saved-no-report', 'history-unavailable']) {
     await change(name);await layout(`state/${name}`);await capture(name)
     if (name === 'neutral-reviewed') {
       assert(await execute('return window.flm.review.title === "Your learned tune is saved" && window.flm.offroad.savedCount === 1'))
@@ -316,6 +349,37 @@ try {
     }
     if (name === 'stale') assert(await execute('return !/Refresh|Reconnect/.test(window.flm.review.description)&&window.flm.savedSummary==="0 saved"'))
     if (name === 'saved') assert.equal(await execute('return window.flm.currentApplied'), false)
+    if (name === 'history-unavailable') {
+      await click('#tuner-tab-tune')
+      assert(await execute('return document.querySelector(".gx-tuner__saved-list").textContent.includes("Saved settings are temporarily unavailable.")'))
+      assert.equal(await execute('return window.flm.review.count'), 5)
+      await capture('history-unavailable-tune');checks.push('unavailable-history-is-not-empty-and-preserves-findings')
+    }
+    if (name.startsWith('earlier-saved')) {
+      const writes = requests.length
+      await click('#tuner-tab-tune')
+      assert(await execute('return window.flm.earlierSaved[0].values.length===3 && window.flm.review.saved.length===0 && !window.flm.currentApplied'))
+      assert(await execute('const e=document.querySelector(".gx-tuner__saved-list");return e.textContent.includes("Earlier saved setup")&&e.textContent.includes("0.36%")&&e.textContent.includes("0.48%")&&!e.textContent.includes("No saved adjustments reported")'))
+      assert.equal(await execute('return window.flm.review.count'), name === 'earlier-saved' ? 5 : 0, 'Displaying saved history must preserve the current suggestion count')
+      await click('.gx-tuner__saved-list summary');await layout(name);await capture(name+'-history')
+      assert.equal(requests.length, writes, 'Reviewing saved history must never write or reactivate a tune')
+      checks.push(name+'/three-saved-values/history-only/no-write')
+    }
+    if (['saved', 'none', 'contradictory', 'unknown-change'].includes(name)) {
+      await click('#tuner-tab-tune')
+      assert(await execute('return document.querySelector("#tuner-saved-title").textContent==="Auto-learned settings"'))
+      if (name === 'saved') {
+        assert(await execute('const e=document.querySelector(".gx-tuner__saved-list");return e.textContent.includes("Saved for the next drive")&&e.textContent.includes("Highway center taper")&&!e.querySelector(".gx-tuner__idea")'))
+        assert.equal(await execute('return document.querySelectorAll(".gx-tuner__findings [data-coordinate]").length'), 4, 'The already-saved target stays in learned settings; the four remaining suggestions stay visible')
+        assert(await execute('return !document.querySelector(".gx-tuner__findings [data-coordinate=highway_center_taper_max]")'), 'An already-saved target must not be presented as an unsaved suggestion')
+      }
+      if (name === 'none') assert.equal(await execute('return document.querySelector("#tuner-suggestions-title").textContent'), 'No new suggestions')
+      if (name === 'contradictory') assert(await execute('return !document.querySelector(".gx-tuner__curve-summary")&&document.querySelector("#tuner-suggestions-title").textContent.includes("needs more evidence")'), 'The evidence heading remains above manual-only suggestions without a speed card')
+      if (name === 'unknown-change') assert(await execute('return document.querySelector(".gx-tuner__saved-list").textContent.includes("Saved state not confirmed.")'), 'Unknown saving cannot appear as a confirmed empty tune')
+      await layout(`sections/${name}`);await capture(`sections-${name}`)
+      checks.push(`sections/${name}`)
+      await click('#tuner-tab-overview')
+    }
     if (name === 'recent-rollback') {
       assert.equal(await execute('return window.flm.review.title'), 'Your previous tune was restored')
       assert.equal(await execute('return window.flm.review.count'), 10)
@@ -435,6 +499,62 @@ try {
     checks.push('full-page-200/'+physical+'/primary-nav');await capture('full-page-200-'+physical+'-footer')
   }
   assert.equal(requests.length,writesBeforeReflow,'Full-page review/navigation must not write settings')
+  await viewport(416);await change('ideas');await click('#tuner-tab-tune')
+  await click('[data-role=flm-backup] summary')
+  await layout('backup/export');await capture('backup-export')
+  const downloads = join(profile, 'downloads');await mkdir(downloads)
+  await command(`/session/${session}/goog/cdp/execute`, { cmd: 'Browser.setDownloadBehavior', params: { behavior: 'allow', downloadPath: downloads } })
+  const beforeBackup = requests.length
+  await click('[data-role=flm-backup] .gx-actions button:first-child')
+  await until(() => existsSync(join(downloads, 'starpilot-flm-tune.json')))
+  assert.deepEqual(JSON.parse(await readFile(join(downloads, 'starpilot-flm-tune.json'), 'utf8')), tuneBackup)
+  assert.equal(requests.length, beforeBackup, 'Export downloads a file without a mutation request')
+  await execute(`const input=document.querySelector('[data-role=flm-backup] input[type=file]'),files=new DataTransfer();
+    files.items.add(new File([arguments[0]],'tune.json',{type:'application/json'}));input.files=files.files;input.dispatchEvent(new Event('change',{bubbles:true}))`, JSON.stringify(tuneBackup))
+  await until(() => execute('return !!document.querySelector("#flm-import-title")'))
+  assert.equal(requests.length, beforeBackup, 'Choosing an imported file is local until review')
+  await layout('backup/import');await capture('backup-import-mobile')
+  await click('dialog[aria-labelledby=flm-import-title] .gx-actions button:last-child')
+  await until(() => execute('return !!document.querySelector("#flm-restore-title")'))
+  assert.equal(requests.at(-1).path, '/api/settings/flm-backup/preview')
+  await layout('backup/confirm');await capture('backup-confirm-mobile')
+  await viewport(1280);await layout('backup/confirm-desktop');await capture('backup-confirm-desktop')
+  await click('dialog[aria-labelledby=flm-restore-title] .gx-actions button:last-child')
+  await until(() => execute('return !document.querySelector("dialog[open]")'))
+  assert.equal(requests.at(-1).path, '/api/settings/flm-backup/confirm')
+  await until(() => execute('return document.querySelector("[data-role=flm-backup]").textContent.includes("1 setting restored")'))
+  backupReject = true
+  await execute(`const input=document.querySelector('[data-role=flm-backup] input[type=file]'),files=new DataTransfer();
+    files.items.add(new File([arguments[0]],'tune.json',{type:'application/json'}));input.files=files.files;input.dispatchEvent(new Event('change',{bubbles:true}))`, JSON.stringify(tuneBackup))
+  await until(() => execute('return !!document.querySelector("#flm-import-title")'))
+  await click('dialog[aria-labelledby=flm-import-title] .gx-actions button:last-child')
+  await until(() => execute('return document.querySelector("dialog[open]").textContent.includes("No Auto Learn setup matches")'))
+  assert(!await execute('return !!document.querySelector("#flm-restore-title")'), 'Incompatible backup never reaches confirmation')
+  await capture('backup-incompatible');await click('dialog[aria-labelledby=flm-import-title] .gx-actions button:first-child')
+  backupReject = false
+  await viewport(416)
+  await execute(`const input=document.querySelector('[data-role=flm-backup] input[type=file]'),files=new DataTransfer();
+    files.items.add(new File([arguments[0]],'tune-v2.json',{type:'application/json'}));input.files=files.files;input.dispatchEvent(new Event('change',{bubbles:true}))`,
+    JSON.stringify({ ...tuneBackup, version: 2, recovery: { compatibility: null, setup: null, manualProfile: null, trials: {} } }))
+  await until(() => execute('return !!document.querySelector("#flm-import-title")'))
+  await click('dialog[aria-labelledby=flm-import-title] input[value=recovery]')
+  await click('dialog[aria-labelledby=flm-import-title] .gx-actions button:last-child')
+  await until(() => execute('return !!document.querySelector("#flm-restore-title")'))
+  assert.equal(requests.at(-1).body.mode, 'recovery')
+  assert(await execute('return document.querySelector("dialog[open]").textContent.includes("your manual tune")'))
+  await layout('backup/manual-recovery');await capture('backup-manual-recovery')
+  await click('dialog[aria-labelledby=flm-restore-title] .gx-actions button:last-child')
+  await until(() => execute('return !document.querySelector("dialog[open]")'))
+  await until(() => execute('return document.querySelector("[data-role=flm-backup]").textContent.includes("Auto Learn is paused")'))
+  await until(() => execute('return !!document.querySelector("#tuner-recovered-title")'))
+  await show('#tuner-recovered-title');await layout('backup/recovered-manual-values');await capture('backup-recovered-manual-values')
+  assert(await execute('return document.querySelector("#tuner-recovered-title").parentElement.textContent.includes("Auto Learn paused")'))
+  checks.push('backup/explicit-manual-recovery-without-auto-qualification')
+  await change('applied', { parked: false });await click('#tuner-tab-tune')
+  await click('[data-role=flm-backup] summary')
+  assert(await execute('return document.querySelector("[data-role=flm-backup] .gx-actions button:last-of-type").disabled'))
+  await capture('backup-driving-locked')
+  checks.push('backup/real-download/local-file/preview/confirmed-restore/incompatible/driving-lockout')
   assert.deepEqual(errors, [])
   console.log(`Real Chromium FLM UI: ${checks.length} responsive/theme/state checks, 5 findings/7 destinations, parked save/reset, driving lockout, errors and retained evidence passed`)
 } catch (error) {
