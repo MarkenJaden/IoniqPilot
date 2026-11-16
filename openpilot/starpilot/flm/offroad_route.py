@@ -99,9 +99,9 @@ def route_inventory(root):
   from openpilot.starpilot.galaxy.drive_history import MAX_ROOT_ENTRIES
 
   try:
-    # Match the existing root scan budget. A 513th segment in another drive
-    # must not invalidate every otherwise complete route in that bounded scan.
-    inventory = DriveHistory(Path(root), max_segments_per_route=MAX_SEGMENTS, max_segments=MAX_ROOT_ENTRIES).snapshot(isolate_route_errors=True)
+    # FLM reviews the bounded local library, beyond the route browser's first page.
+    inventory = DriveHistory(Path(root), max_segments_per_route=MAX_SEGMENTS,
+                             max_segments=MAX_ROOT_ENTRIES, max_routes=MAX_ROOT_ENTRIES).snapshot(isolate_route_errors=True)
   except DriveHistoryUnavailable as error:
     raise ValueError('Local drive inventory is unavailable') from error
   if inventory['scanIncomplete']:
@@ -119,7 +119,7 @@ def source_revisions(root, route):
   segments = route.get('segments', ())
   if not segments and type(route.get('routeId')) is str and LOCAL_ID.fullmatch(route['routeId']):
     try:
-      segments = [{'segmentName': name} for name in sorted(_route_names(Path(root), route['routeId'], lambda: True))[:MAX_SEGMENTS]]
+      segments = [{'segmentName': name} for name in sorted(_route_names(Path(root), route['routeId'], lambda: True))]
     except _Incomplete:
       segments = ()
   for segment in segments:

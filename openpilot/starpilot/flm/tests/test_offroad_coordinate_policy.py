@@ -702,7 +702,7 @@ class TestShortTurnProposalCoverage(unittest.TestCase):
     self.assertEqual(set(selector.spans), {w['identity'] for g in (short, stable) for w in g['selected_original_windows']})
     self.assertEqual(len(selector.spans), 12)
 
-  def dispatch(self, *, training_count=3, overlap=False):
+  def dispatch(self, *, training_count=3, overlap=False, native_count=None):
     from types import SimpleNamespace
     from openpilot.starpilot.flm import offroad_worker as module
     from openpilot.starpilot.flm.offroad_processor import CompletedAssessment
@@ -713,6 +713,8 @@ class TestShortTurnProposalCoverage(unittest.TestCase):
     roles = {'training': {'windows': ids[:training_count], 'reference_rms': 0.1}, 'heldout': {'windows': ids[3:], 'reference_rms': 0.1}}
     metadata = {'route_values': tuple(values().items()), 'route_revision': REVISION, 'controller_mode': 'starpilot', 'route_scope': scope().key()}
     short = {'cohort': '2:left:turn_in', 'whole_windows': 6, 'proposal': None, **roles}
+    if native_count is not None:
+      short['qualification_roles'] = {'training': {'windows': ids[:training_count][:native_count]}, 'heldout': {'windows': ids[3:][:native_count]}}
     original = [{'identity': wid, 'segment': 0, 'start_ns': (100 + i * 10) * 10**9, 'end_ns': (102 + i * 10) * 10**9} for i, wid in enumerate(ids)]
     group = {'original_metadata': metadata, 'original_context_sha256': 'f' * 64, 'cohorts': [short], 'selected_original_windows': original}
     selected = values()
@@ -724,6 +726,8 @@ class TestShortTurnProposalCoverage(unittest.TestCase):
       long_ids = tuple(str(i) * 64 for i in range(1, 7))
       long_roles = {'training': {'windows': long_ids[:3], 'reference_rms': 0.6}, 'heldout': {'windows': long_ids[3:], 'reference_rms': 0.6}}
       long_cohort = {'cohort': '2:both:center', 'whole_windows': 6, **long_roles}
+      if native_count is not None:
+        long_cohort['qualification_roles'] = {'training': {'windows': long_ids[:3][:native_count]}, 'heldout': {'windows': long_ids[3:][:native_count]}}
       long_original = [{'identity': wid, 'segment': 0, 'start_ns': i * 10**10, 'end_ns': i * 10**10 + 6 * 10**9} for i, wid in enumerate(long_ids)]
       stable_groups = (dict(group, cohorts=[long_cohort], selected_original_windows=long_original),)
       for i in range(3):
@@ -740,9 +744,11 @@ class TestShortTurnProposalCoverage(unittest.TestCase):
 
       def propose(self, actual_group, cohort):
         events.append(('profile', cohort['cohort']))
+        proof = {'coordinate_candidates': [proposal], 'roles': {role: {'original_windows': cohort[role]['windows'],
+                 'coordinate_candidates': [proposal]} for role in ('training', 'heldout')}}
         if cohort['cohort'].endswith('center'):
-          return proposal, {'coordinate_candidates': []}
-        return None, {'coordinate_candidates': [proposal]}
+          return proposal, dict(proof, frozen_training_profile=proposal, coordinate_candidates=[])
+        return None, proof
 
     def assessed(params, root, previous, *, permitted):
       previous(cp)
@@ -776,6 +782,7 @@ class TestShortTurnProposalCoverage(unittest.TestCase):
           assessor=assessed, checker=refused, scope_for=lambda cp, params: scope()).run_once()
       self.assertFalse(result['configuration_changed'])
       self.assertIsNone(params.get(KEY), 'A proposal or mocked native refusal cannot save an automatic tune')
+    self.last_result = result
     return events
 
   def test_short_turn_reaches_original_native_refusal_only_with_both_full_partitions(self):
@@ -1080,7 +1087,7 @@ class TestBoundedInconclusiveTrialLifecycle(unittest.TestCase):
         self.assertNotEqual(saved['analysis_sha256'], digest)
         self.assertEqual(record['trial_analysis_sha256'], first_digest, 'Retained trials keep constant-depth provenance')
         self.assertFalse((cache.directory / ('trial-' + saved['analysis_sha256'] + '.json')).exists())
-        with patch.object(module, '_current_scope', return_value=scope()):
+        with patch('openpilot.starpilot.flm.offroad_runtime.current_scope', return_value=scope()):
           guard = from_configuration(None, params, cache.directory, vehicle_session='f' * 32)
         self.assertIsNotNone(guard)
         assert guard is not None
@@ -1417,7 +1424,7 @@ class TestSelectedCurrentDriveInputs(unittest.TestCase):
       with self.subTest(invalid=invalid), self.assertRaises(ValueError):
         self.selected_source(**invalid)
 
-  def test_primary_long_drive_reuses_selected_reader_without_a_full_scan(self):
+  def test_primary_long_drive_reviews_every_original_segment(self):
     from types import SimpleNamespace
     from openpilot.starpilot.flm import offroad_processor as processor
     from openpilot.starpilot.flm import offroad_prior_inputs as inputs
@@ -1429,20 +1436,22 @@ class TestSelectedCurrentDriveInputs(unittest.TestCase):
       'recorded_lateral_request_rows': 100, 'active_lateral_request_rows': 90, 'invalid_lateral_request_rows': 0,
     }, quality_stops=[])
 
-    def collect(root, actual, *, permitted, walker):
+    def collect(root, actual, *, permitted, walker=None):
+      walker = processor.walk_completed_route if walker is None else walker
       self.assertEqual(walker(root, actual, permitted=permitted, consume=lambda *args: None), receipt)
       return collected
 
     with (
       patch.object(processor, 'latest_route', return_value=route),
       patch.object(processor, 'collect_route_inputs', side_effect=collect),
-      patch.object(processor, 'walk_completed_route', side_effect=AssertionError('Long drive must not start a full scan')),
+      patch.object(processor, 'walk_completed_route', return_value=receipt) as complete,
       patch.object(inputs, '_selected_sources', return_value=receipt) as selected,
     ):
       actual, result = processor.collect_latest_steering_inputs(None, '.', permitted=lambda: True)
     self.assertEqual(actual, route)
     self.assertIs(result, collected)
-    self.assertIsNone(selected.call_args.kwargs['cp_sha256'])
+    complete.assert_called_once()
+    selected.assert_not_called()
 
 
 
