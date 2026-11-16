@@ -6,10 +6,13 @@ from dataclasses import dataclass, field
 
 # Decimal CAN IDs -> hex:
 ADDR_DATC11 = 0x044     # 68
+ADDR_TCU_DCT13 = 0x162  # 354
 ADDR_EMS_H12 = 0x18F    # 399
 ADDR_EMS20 = 0x200      # 512
+ADDR_EMS16 = 0x260      # 608
 ADDR_EMS11 = 0x316      # 790
 ADDR_EMS12 = 0x329      # 809
+ADDR_EMS_366 = 0x366    # 870
 ADDR_WHL_SPD11 = 0x386  # 902
 ADDR_ABS11 = 0x38A      # 906
 ADDR_FCA11 = 0x38D      # 909
@@ -49,6 +52,7 @@ class IoniqCanState:
 
   last_update_s: float = 0.0
   seen_addresses: dict[int, float] = field(default_factory=dict)
+  seen_bus0_addresses: set[int] = field(default_factory=set)
 
   # Powertrain / Engine / Hybrid (EMS11, EMS12, EMS14, EMS_H12, EMS20)
   ignition_on: bool | None = None
@@ -58,6 +62,9 @@ class IoniqCanState:
   vehicle_speed_ems_kph: float = 0.0
   engine_torque_pct: float = 0.0
   tqi_b_pct: float = 0.0
+  puc_stat_fuel_cut: bool = False
+  pre_fuel_cut_in: bool = False
+  ems16_eng_stat: int = 0
   coolant_temp_c: float | None = None
   fuel_temp_c: float | None = None
   ambient_temp_c: float | None = None
@@ -139,18 +146,23 @@ class IoniqCanState:
 
   def cluster_avg_l_per_100km(self) -> float | None:
     val = self.cluster_avg_fc_value
-    if val is None or val <= 0.0:
+    if val is None or val <= 0.1 or val >= 99.0:
       return None
+    # 0: km/L, 1: L/100km (EU), 2: MPG (US), 3: MPG (UK)
     if self.cluster_avg_fc_unit == 1:
-      return round(val, 2)
+      return round(float(val), 2)
     if self.cluster_avg_fc_unit == 0:
-      return round(100.0 / val, 2)
+      return round(100.0 / val, 2) if val > 0.5 else None
     if self.cluster_avg_fc_unit == 2:
-      return round(235.215 / val, 2)
-    return round(val, 2) if val <= 15.0 else round(100.0 / val, 2)
+      return round(235.215 / val, 2) if val > 1.0 else None
+    if self.cluster_avg_fc_unit == 3:
+      return round(282.481 / val, 2) if val > 1.0 else None
+    return round(float(val), 2) if val <= 15.0 else round(100.0 / val, 2)
 
   def engine_is_firing(self) -> bool:
     if self.fuel_cut_idle_stop or self.fuel_cut_open:
+      return False
+    if (self.puc_stat_fuel_cut or self.pre_fuel_cut_in) and max(self.engine_torque_pct, self.tqi_b_pct) <= 2.0:
       return False
     if self.engine_rpm > 450.0:
       return True
@@ -233,10 +245,13 @@ class IoniqCanState:
     }
 
   def apply_frame(self, ts: float, address: int, data: bytes | bytearray | memoryview, bus: int = 0) -> None:
-    if bus != 0 and address not in self.seen_addresses:
-      # Main powertrain/cluster frames live on bus 0 (C-CAN); ignore non-bus-0 duplicates unless unseen elsewhere.
-      if bus > 2:
-        return
+    if bus > 2:
+      return
+    if bus == 0:
+      self.seen_bus0_addresses.add(address)
+    elif address in self.seen_bus0_addresses:
+      # Main powertrain/cluster frames live on bus 0 (C-CAN); ignore non-bus-0 duplicates.
+      return
     if len(data) == 0:
       return
     self.last_update_s = ts
@@ -245,10 +260,27 @@ class IoniqCanState:
     if address == ADDR_EMS11 and len(data) >= 7:
       self.ignition_on = bool(extract_intel(data, 0, 1))
       self.engine_running_flag = bool(extract_intel(data, 1, 1))
+      self.puc_stat_fuel_cut = bool(extract_intel(data, 3, 1))
       self.ac_relay_on = bool(extract_intel(data, 6, 1))
       self.engine_rpm = float(extract_intel(data, 16, 16, scale=0.25))
       self.engine_torque_pct = float(extract_intel(data, 32, 8, scale=0.390625))
       self.vehicle_speed_ems_kph = float(extract_intel(data, 48, 8))
+    elif address == ADDR_EMS16 and len(data) >= 4:
+      tqi = float(extract_intel(data, 8, 8, scale=0.390625))
+      if ADDR_EMS11 not in self.seen_addresses or self.engine_torque_pct <= 0.0:
+        self.engine_torque_pct = tqi
+      self.pre_fuel_cut_in = bool(extract_intel(data, 27, 1))
+      self.ems16_eng_stat = int(extract_intel(data, 28, 3))
+    elif address == ADDR_EMS_366 and len(data) >= 6:
+      rpm = float(extract_intel(data, 8, 16, scale=0.25))
+      if ADDR_EMS11 not in self.seen_addresses or self.engine_rpm <= 0.0:
+        self.engine_rpm = rpm
+        self.engine_torque_pct = max(self.engine_torque_pct, float(extract_intel(data, 0, 8, scale=0.390625)))
+    elif address == ADDR_TCU_DCT13 and len(data) >= 3:
+      rpm_flag = bool(extract_intel(data, 23, 1))
+      rpm = float(extract_intel(data, 10, 13, scale=0.9766))
+      if (ADDR_EMS11 not in self.seen_addresses and ADDR_EMS_366 not in self.seen_addresses) or (rpm_flag and self.engine_rpm <= 0.0):
+        self.engine_rpm = rpm
     elif address == ADDR_EMS12 and len(data) >= 2:
       raw_coolant = int(extract_intel(data, 8, 8))
       if raw_coolant not in (0xFE, 0xFF):
@@ -258,8 +290,6 @@ class IoniqCanState:
       raw_isg = int(extract_intel(data, 35, 3))
       self.isg_stat = 0 if raw_isg == 0x7 else raw_isg
       self.limp_home_mode = bool(extract_intel(data, 39, 1))
-      self.fuel_cut_idle_stop = bool(extract_intel(data, 58, 1))
-      self.fuel_cut_open = bool(extract_intel(data, 59, 1))
       self.eco_active = bool(extract_intel(data, 60, 1))
       self.engine_running_normal = bool(extract_intel(data, 61, 1))
     elif address == ADDR_EMS20 and len(data) >= 2:

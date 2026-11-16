@@ -117,18 +117,7 @@ def estimate_fuel_rate_lph(can_state: IoniqCanState, *, calibration_factor: floa
 
 def cluster_avg_l_per_100km(can_state: IoniqCanState) -> float | None:
   """Convert CLU13 CF_Clu_AvgFCI to L/100km regardless of cluster unit setting."""
-  val = can_state.cluster_avg_fc_value
-  if val is None or val <= 0.1 or val >= 99.0:
-    return None
-  unit = can_state.cluster_avg_fc_unit
-  # 0: L/100km (EU default), 1: km/L, 2: MPG (US), 3: MPG (UK)
-  if unit == 1:
-    return round(100.0 / val, 2) if val > 0.5 else None
-  if unit == 2:
-    return round(235.215 / val, 2) if val > 1.0 else None
-  if unit == 3:
-    return round(282.481 / val, 2) if val > 1.0 else None
-  return round(float(val), 2)
+  return can_state.cluster_avg_l_per_100km()
 
 
 class FuelTripTracker:
@@ -411,10 +400,12 @@ class FuelTripTracker:
     total_dur = max(0.001, float(trip['durationS']))
     trip['evTimePct'] = round(float(trip['evDurationS']) / total_dur * 100.0, 1)
     if float(trip['distanceKm']) >= 0.05:
+      trip['evDistancePct'] = round(min(100.0, max(0.0, float(trip['evDistanceKm']) / float(trip['distanceKm']) * 100.0)), 1)
       l100 = float(trip['fuelLiters']) / float(trip['distanceKm']) * 100.0
       trip['avgLPer100Km'] = round(l100, 2)
       trip['avgKmPerL'] = round(float(trip['distanceKm']) / float(trip['fuelLiters']), 2) if float(trip['fuelLiters']) > 0 else None
     elif clu_l100 is not None and float(trip['distanceKm']) > 0.0:
+      trip['evDistancePct'] = 0.0
       trip['avgLPer100Km'] = clu_l100
       trip['avgKmPerL'] = round(100.0 / clu_l100, 2) if clu_l100 > 0 else None
     trip['estimatedCostEur'] = round(float(trip['fuelLiters']) * self.price_per_liter, 2)
@@ -424,7 +415,7 @@ class FuelTripTracker:
       trip['maxCoolantC'] = round(can_state.coolant_temp_c if prev_cool is None else max(prev_cool, can_state.coolant_temp_c), 1)
     if can_state.ambient_temp_c is not None:
       trip['ambientTempC'] = round(can_state.ambient_temp_c, 1)
-    if can_state.cluster_avg_fc_value is not None:
+    if clu_l100 is not None and can_state.cluster_avg_fc_value is not None:
       trip['clusterAvgFci'] = can_state.cluster_avg_fc_value
       trip['clusterAvgLPer100Km'] = clu_l100
     if can_state.bat_12v_voltage_v is not None:

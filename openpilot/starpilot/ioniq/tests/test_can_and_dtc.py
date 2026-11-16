@@ -326,6 +326,31 @@ class TestCanAndDtc(unittest.TestCase):
       self.assertIsNotNone(cont)
       self.assertEqual(len(rec.list_recordings()), 2)
 
+  def test_bus0_protection_and_ems_h12_firing(self) -> None:
+    st = IoniqCanState()
+    # EMS11: IGK=1, F_N_ENG=1, RPM=1800 (7200), TQI=35% (90)
+    st.apply_frame(1.0, ADDR_EMS11, encode_intel([(0, 1, 1), (1, 1, 1), (16, 16, 7200), (32, 8, 90)]), bus=0)
+    # EMS_H12 with bits 58 & 59 set (unmapped byte-7 bits on real 2016 Ioniq HEV) must NOT suppress firing
+    st.apply_frame(1.1, ADDR_EMS_H12, encode_intel([(16, 8, 80), (58, 1, 1), (59, 1, 1)]), bus=0)
+    self.assertTrue(st.engine_is_firing())
+
+    # CLU13 on bus 0 (7.4 L/100km, unit=1) must not be overwritten by CLU13 on bus 2 (0.0)
+    st.apply_frame(1.2, ADDR_CLU13, encode_intel([(3, 2, 1), (6, 10, 74)]), bus=0)
+    st.apply_frame(1.3, ADDR_CLU13, encode_intel([(3, 2, 1), (6, 10, 0)]), bus=2)
+    self.assertEqual(st.cluster_avg_l_per_100km(), 7.4)
+
+    # FuelTripTracker preserves valid clusterAvgLPer100Km if CLU13 drops to 0.0 at shutdown
+    from openpilot.starpilot.ioniq.fuel_tracker import FuelTripTracker
+    with tempfile.TemporaryDirectory() as tmp:
+      tracker = FuelTripTracker(tmp)
+      tracker.update(st, 1.0, wall_time=1000.0)
+      st.apply_frame(2.0, ADDR_EMS11, encode_intel([(0, 1, 1), (1, 1, 1), (16, 16, 7200), (32, 8, 90), (48, 8, 60)]), bus=0)
+      snap = tracker.update(st, 5.0, wall_time=1004.0)
+      self.assertEqual(snap['activeTrip']['clusterAvgLPer100Km'], 7.4)
+      st.apply_frame(6.0, ADDR_CLU13, encode_intel([(3, 2, 1), (6, 10, 0)]), bus=0)
+      snap2 = tracker.update(st, 6.0, wall_time=1005.0)
+      self.assertEqual(snap2['activeTrip']['clusterAvgLPer100Km'], 7.4)
+
 
 if __name__ == '__main__':
   unittest.main()
