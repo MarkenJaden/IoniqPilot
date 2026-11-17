@@ -10,7 +10,7 @@ from openpilot.starpilot.ui.layout_preview_transport import PreviewService
 
 class LayoutPreviewRuntime:
   def __init__(self, params, active_profile: str, *, offroad_hint=lambda: True, authority=None):
-    self.renderer = LayoutPreviewRenderer()
+    self.renderer = LayoutPreviewRenderer(params)
     self.authority = authority if authority is not None else LiveContextSource(params)
     self.service = PreviewService(self.renderer, self.authority.parked, active_profile=active_profile)
     self._offroad_hint = offroad_hint

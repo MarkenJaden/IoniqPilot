@@ -284,12 +284,16 @@ class IoniqRuntimeController:
     elm327_active: bool = False,
     can_send: Callable[[list[Any]], Any] | None = None,
     can_recv: Callable[..., list[Any]] | None = None,
+    car_state_msg: Any | None = None,
   ) -> dict[str, Any]:
     """Process a batch of CAN frames `(bus, address, data)` plus peripheral state."""
     now = wall_time if wall_time is not None else _utc_timestamp()
     if (mono_s - self._last_sync_mono) >= 0.4:
       self._last_sync_mono = mono_s
       self._reload_external_changes(mono_s)
+
+    if car_state_msg is not None:
+      self.can_state.apply_car_state(car_state_msg, mono_s)
 
     learn_just_completed = False
     bindings = list(self._buttons_state.get('bindings') or [])
@@ -347,7 +351,9 @@ class IoniqRuntimeController:
       self._last_diag_sync_mono = mono_s
       diag = read_diagnostics_state(self.root)
       diag['passive'] = self.monitor.snapshot()
-      diag['liveSummary'] = self.can_state.summary()
+      live_summary = self.can_state.summary()
+      live_summary['instantFuelRateLph'] = round(float(fuel_snap.get('sourceDiagnostics', {}).get('instantFuelRateLph', 0.0)), 2)
+      diag['liveSummary'] = live_summary
       diag['recorderStatus'] = {
         'continuousActive': self.recorder._continuous_session is not None,
         'ringBufferSamples': len(self.recorder._ring),
@@ -462,13 +468,14 @@ def main(
           for msg in pkt.can:
             frames.append((int(msg.src), int(msg.address), bytes(msg.dat)))
 
-        ign_hint = bool(sm['deviceState'].started) if sm.alive['deviceState'] else None
+        ign_hint = bool(sm['deviceState'].started) if sm.alive.get('deviceState') else None
         elm_active = False
-        if sm.alive['pandaStates'] and len(sm['pandaStates']) > 0:
+        if sm.alive.get('pandaStates') and len(sm['pandaStates']) > 0:
           try:
             elm_active = str(sm['pandaStates'][0].safetyModel) == 'elm327'
           except Exception:
             elm_active = False
+        car_state_msg = sm['carState'] if sm.alive.get('carState') else None
 
         controller.step(
           frames,
@@ -478,6 +485,7 @@ def main(
           elm327_active=elm_active,
           can_send=can_send if elm_active else None,
           can_recv=can_recv if elm_active else None,
+          car_state_msg=car_state_msg,
         )
         backoff_s = 1.0
         rk.keep_time()

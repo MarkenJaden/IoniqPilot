@@ -23,7 +23,7 @@ from openpilot.starpilot.ui.onroad_widget_style import draw_widget_frame
 from openpilot.starpilot.curve_speed.status import CurveObservation
 from openpilot.starpilot.ui.onroad_state import ConditionalLead, speed_limit_bounds
 from openpilot.starpilot.ui.onroad_state import AlertSize, ObservationKind, OnroadAlert, OnroadState, SourceReading, SpeedLimitObservation
-from openpilot.starpilot.ui.appearance_preferences import CameraViewChoice, OnroadAppearance
+from openpilot.starpilot.ui.appearance_preferences import CameraViewChoice, OnroadAppearance, read_visibility
 from openpilot.starpilot.ui.onroad_dm import draw_monitor_art, monitor_bounds, monitor_visible
 from openpilot.starpilot.ui.onroad_stopped_timer import PREVIEW_DURATION_S
 from openpilot.starpilot.ui.layout_preview_sidebar import SIDEBAR_WIDTH, render_sidebar
@@ -387,7 +387,11 @@ class _Canvas:
             # General edit shows a representative CEM sample even though its backdrop
             # remains engaged. Driving scenes always use their unmodified state.
             sample = {'cem_gauge': 'cem_curve', 'speed_limit_actions': 'slc_pending'}.get(key) if general else None
-            widget_state = sample_state(sample, state.customization) if sample is not None else state
+            if sample is not None:
+              widget_state = sample_state(sample, state.customization)
+              widget_state = replace(widget_state, appearance=replace(widget_state.appearance, use_vienna_sign=state.appearance.use_vienna_sign))
+            else:
+              widget_state = state
             if key == "rear_fog":
               from openpilot.starpilot.car.ford.rear_fog import boot_time_ns
               widget_state = replace(widget_state, ford_rear_fog_on=True, ford_rear_fog_source_ns=boot_time_ns())
@@ -482,7 +486,8 @@ class _Canvas:
 
 
 class LayoutPreviewRenderer:
-  def __init__(self):
+  def __init__(self, params=None):
+    self.params = params
     self._canvas: _Canvas | None = None
     self._last_use = 0.0
 
@@ -513,6 +518,9 @@ class LayoutPreviewRenderer:
       # Widget art is cropped from the saved 1860px road, as the editor places each sprite itself.
       document = fit_to_road(document, ROAD_BASE_WIDTH if payload.get('art') is True else width)
     state = sample_state(scene, document)
+    if self.params is not None:
+      vienna = read_visibility(self.params, "UseVienna").value is True
+      state = replace(state, appearance=replace(state.appearance, use_vienna_sign=vienna))
     if profile == Profile.LARGE and viewport is None:
       state = replace(state, viewport_width=width, appearance=replace(state.appearance, show_developer_sidebar=sidebar))
     elif viewport is not None:

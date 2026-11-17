@@ -5,18 +5,26 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 # Decimal CAN IDs -> hex:
-ADDR_DATC11 = 0x044     # 68
-ADDR_TCU_DCT13 = 0x162  # 354
-ADDR_EMS_H12 = 0x18F    # 399
-ADDR_EMS20 = 0x200      # 512
-ADDR_EMS16 = 0x260      # 608
-ADDR_EMS11 = 0x316      # 790
-ADDR_EMS12 = 0x329      # 809
-ADDR_EMS_366 = 0x366    # 870
-ADDR_WHL_SPD11 = 0x386  # 902
-ADDR_ABS11 = 0x38A      # 906
-ADDR_FCA11 = 0x38D      # 909
-ADDR_TCU14 = 0x502      # 1282
+ADDR_DATC11 = 0x044      # 68
+ADDR_EMS_DCT11 = 0x080   # 128
+ADDR_EMS_DCT12 = 0x081   # 129
+ADDR_TCU_DCT13 = 0x162   # 354
+ADDR_EMS_H12 = 0x18F     # 399
+ADDR_EMS20 = 0x200       # 512
+ADDR_ESP12 = 0x220       # 544
+ADDR_EMS16 = 0x260       # 608
+ADDR_EMS13 = 0x280       # 640
+ADDR_EMS11 = 0x316       # 790
+ADDR_EMS12 = 0x329       # 809
+ADDR_EMS_366 = 0x366     # 870
+ADDR_E_EMS11 = 0x371     # 881
+ADDR_ELECT_GEAR = 0x372  # 882
+ADDR_WHL_SPD11 = 0x386   # 902
+ADDR_ABS11 = 0x38A       # 906
+ADDR_FCA11 = 0x38D       # 909
+ADDR_TCS13 = 0x394       # 916
+ADDR_SCC12 = 0x421       # 1057
+ADDR_TCU14 = 0x502       # 1282
 ADDR_TCS15 = 0x507      # 1287
 ADDR_CLU13 = 0x50C      # 1292
 ADDR_CLU15 = 0x52A      # 1322
@@ -137,12 +145,127 @@ class IoniqCanState:
   obd_coolant_c: float | None = None
   obd_control_module_v: float | None = None
 
+  # Classic Hyundai HEV Bus-0 / C-CAN signals (E_EMS11, ELECT_GEAR, TCS13, ESP12, SCC12)
+  accel_pedal_raw: float = 0.0
+  vcu_accel_pedal_raw: float = 0.0
+  gas_pedal_pct: float = 0.0
+  e_ems11_brake_pos: int = 0
+  ig_reactive_stat: int = 0
+  gear_shifter_raw: int | None = None
+  long_accel_mps2: float | None = None
+  brake_cyl_press: float = 0.0
+  tcs_a_basis_mps2: float | None = None
+  tcs_driver_braking: bool = False
+  tcs_brake_light: bool = False
+  tcs_driver_override: int = 0
+  tcs_acc_req: bool = False
+  tqi_scc_pct: float = 0.0
+  scc_acc_mode: int = 0
+  scc_a_req_mps2: float | None = None
+
+  # Derived wheel kinematics & optional Cereal carState mirror
+  wheel_accel_mps2: float | None = None
+  _prev_wheel_speed_kph: float | None = None
+  _prev_wheel_ts: float | None = None
+  cs_last_update_s: float = 0.0
+  cs_v_ego_mps: float | None = None
+  cs_a_ego_mps2: float | None = None
+  cs_gas_pressed: bool | None = None
+  cs_brake_pressed: bool | None = None
+  cs_standstill: bool | None = None
+  cs_gear_shifter: str | None = None
+  cs_cruise_enabled: bool | None = None
+
+  # Synthetic HEV model outputs (populated when C-CAN lacks direct EMS11/EMS_DCT11 RPM)
+  synthetic_engine_rpm: float = 0.0
+  synthetic_engine_firing: bool = False
+  instant_fuel_rate_lph: float = 0.0
+  _tcu_dct13_rpm_valid: bool = False
+
   def best_speed_kph(self) -> float:
     if ADDR_WHL_SPD11 in self.seen_addresses:
       return self.wheel_speed_kph
     if ADDR_CLU15 in self.seen_addresses:
       return self.cluster_speed_kph
-    return self.vehicle_speed_ems_kph
+    if self.vehicle_speed_ems_kph > 0.0 or ADDR_EMS11 in self.seen_addresses:
+      return self.vehicle_speed_ems_kph
+    if self.cs_v_ego_mps is not None:
+      return max(0.0, float(self.cs_v_ego_mps) * 3.6)
+    return 0.0
+
+  def has_direct_engine_rpm(self) -> bool:
+    return bool(
+      ADDR_EMS11 in self.seen_addresses
+      or ADDR_EMS_366 in self.seen_addresses
+      or ADDR_EMS_DCT11 in self.seen_addresses
+      or ADDR_EMS13 in self.seen_addresses
+      or self._tcu_dct13_rpm_valid
+    )
+
+  def gear_shifter_label(self) -> str:
+    if self.gear_shifter_raw is not None:
+      return {0: 'P', 4: 'S', 5: 'D', 6: 'N', 7: 'R', 8: 'S'}.get(self.gear_shifter_raw, '')
+    if self.cs_gear_shifter:
+      g = str(self.cs_gear_shifter).lower()
+      if 'park' in g or g == 'p':
+        return 'P'
+      if 'reverse' in g or g == 'r':
+        return 'R'
+      if 'neutral' in g or g == 'n':
+        return 'N'
+      if 'sport' in g or g == 'low' or g == 's':
+        return 'S'
+      if 'drive' in g or g == 'd':
+        return 'D'
+    return ''
+
+  def is_braking_or_regen(self) -> bool:
+    return bool(
+      self.tcs_driver_braking
+      or self.tcs_brake_light
+      or self.brake_cyl_press > 3.0
+      or self.e_ems11_brake_pos > 2
+      or self.cs_brake_pressed
+    )
+
+  def effective_accel_mps2(self) -> float:
+    if self.wheel_accel_mps2 is not None:
+      return self.wheel_accel_mps2
+    if self.cs_a_ego_mps2 is not None:
+      return float(self.cs_a_ego_mps2)
+    if self.scc_acc_mode in (1, 2) and self.scc_a_req_mps2 is not None:
+      return float(self.scc_a_req_mps2)
+    return 0.0
+
+  def tractive_power_kw(self) -> float:
+    """Longitudinal wheel power demand (kW) for 2016 Hyundai Ioniq Hybrid (1480 kg, Cd=0.24, A=2.24 m^2)."""
+    v_mps = max(0.0, self.best_speed_kph() / 3.6)
+    gas_pct = self.gas_pedal_pct
+    if self.cs_gas_pressed and gas_pct <= 1.0:
+      gas_pct = 18.0
+    if v_mps < 0.25:
+      if gas_pct > 5.0 and self.gear_shifter_label() in ('D', 'S', 'R', ''):
+        return min(35.0, (gas_pct - 5.0) * 0.35)
+      return 0.0
+    mass_kg = 1480.0
+    f_roll = 0.0090 * mass_kg * 9.80665
+    f_aero = 0.5 * 1.225 * 0.24 * 2.24 * (v_mps * v_mps)
+    accel = self.effective_accel_mps2()
+    if self.scc_acc_mode in (1, 2) and self.scc_a_req_mps2 is not None:
+      accel = 0.65 * accel + 0.35 * float(self.scc_a_req_mps2)
+    f_inertia = (mass_kg * 1.04) * accel
+    power_kw = (f_roll + f_aero + f_inertia) * v_mps / 1000.0
+    if gas_pct > 8.0 and v_mps < 14.0 and accel > -0.15:
+      power_kw = max(power_kw, (gas_pct - 5.0) * 0.42)
+    return max(-45.0, min(105.0, power_kw))
+
+  def cluster_avg_fc_unit_label(self) -> str:
+    return {
+      0: 'km/L',
+      1: 'L/100km',
+      2: 'MPG (US)',
+      3: 'MPG (UK)',
+    }.get(self.cluster_avg_fc_unit if self.cluster_avg_fc_unit is not None else 1, 'L/100km')
 
   def cluster_avg_l_per_100km(self) -> float | None:
     val = self.cluster_avg_fc_value
@@ -160,6 +283,8 @@ class IoniqCanState:
     return round(float(val), 2) if val <= 15.0 else round(100.0 / val, 2)
 
   def engine_is_firing(self) -> bool:
+    if not self.has_direct_engine_rpm():
+      return bool(self.synthetic_engine_firing)
     if self.fuel_cut_idle_stop or self.fuel_cut_open:
       return False
     if (self.puc_stat_fuel_cut or self.pre_fuel_cut_in) and max(self.engine_torque_pct, self.tqi_b_pct) <= 2.0:
@@ -169,6 +294,35 @@ class IoniqCanState:
     return self.engine_rpm > 250.0 and (
       self.engine_running_flag or self.engine_running_normal or self.engine_torque_pct > 1.0 or self.tqi_b_pct > 1.0
     )
+
+  def apply_car_state(self, car_state: object, ts: float) -> None:
+    """Ingest optional Cereal carState snapshot when available alongside raw C-CAN frames."""
+    if car_state is None:
+      return
+    self.cs_last_update_s = ts
+    v_ego = getattr(car_state, 'vEgo', None)
+    if isinstance(v_ego, (int, float)):
+      self.cs_v_ego_mps = float(v_ego)
+    a_ego = getattr(car_state, 'aEgo', None)
+    if isinstance(a_ego, (int, float)):
+      self.cs_a_ego_mps2 = float(a_ego)
+    gas_pressed = getattr(car_state, 'gasPressed', None)
+    if isinstance(gas_pressed, bool):
+      self.cs_gas_pressed = gas_pressed
+    brake_pressed = getattr(car_state, 'brakePressed', None)
+    if isinstance(brake_pressed, bool):
+      self.cs_brake_pressed = brake_pressed
+    standstill = getattr(car_state, 'standstill', None)
+    if isinstance(standstill, bool):
+      self.cs_standstill = standstill
+    gear_shifter = getattr(car_state, 'gearShifter', None)
+    if gear_shifter is not None:
+      self.cs_gear_shifter = str(gear_shifter)
+    cruise_state = getattr(car_state, 'cruiseState', None)
+    if cruise_state is not None:
+      enabled = getattr(cruise_state, 'enabled', None)
+      if isinstance(enabled, bool):
+        self.cs_cruise_enabled = enabled
 
   def battery_12v_health(self) -> dict:
     voltage = self.bat_12v_voltage_v
@@ -271,6 +425,28 @@ class IoniqCanState:
         self.engine_torque_pct = tqi
       self.pre_fuel_cut_in = bool(extract_intel(data, 27, 1))
       self.ems16_eng_stat = int(extract_intel(data, 28, 3))
+    elif address == ADDR_EMS_DCT11 and len(data) >= 7:
+      pv_pct = float(extract_intel(data, 0, 8, scale=0.3906))
+      if ADDR_E_EMS11 not in self.seen_addresses:
+        self.gas_pedal_pct = min(100.0, max(0.0, pv_pct))
+      f_n_eng = bool(extract_intel(data, 14, 1))
+      rpm = float(extract_intel(data, 16, 16, scale=0.25))
+      tqi = float(extract_intel(data, 48, 8, scale=0.390625))
+      if ADDR_EMS11 not in self.seen_addresses:
+        self.engine_running_flag = f_n_eng
+        self.engine_rpm = rpm
+        self.engine_torque_pct = tqi
+    elif address == ADDR_EMS_DCT12 and len(data) >= 3:
+      raw_iat = int(extract_intel(data, 16, 8))
+      if raw_iat not in (0xFE, 0xFF) and ADDR_EMS15 not in self.seen_addresses:
+        self.intake_air_temp_c = float(raw_iat * 0.75 - 48.0)
+    elif address == ADDR_EMS13 and len(data) >= 5:
+      raw_tco = int(extract_intel(data, 24, 8))
+      if raw_tco not in (0xFE, 0xFF) and ADDR_EMS12 not in self.seen_addresses:
+        self.coolant_temp_c = float(raw_tco * 0.75 - 48.0)
+      rpm_32 = float(extract_intel(data, 32, 8, scale=32.0))
+      if ADDR_EMS11 not in self.seen_addresses and ADDR_EMS_DCT11 not in self.seen_addresses:
+        self.engine_rpm = rpm_32
     elif address == ADDR_EMS_366 and len(data) >= 6:
       rpm = float(extract_intel(data, 8, 16, scale=0.25))
       if ADDR_EMS11 not in self.seen_addresses or self.engine_rpm <= 0.0:
@@ -279,8 +455,41 @@ class IoniqCanState:
     elif address == ADDR_TCU_DCT13 and len(data) >= 3:
       rpm_flag = bool(extract_intel(data, 23, 1))
       rpm = float(extract_intel(data, 10, 13, scale=0.9766))
+      if rpm_flag and rpm > 50.0:
+        self._tcu_dct13_rpm_valid = True
       if (ADDR_EMS11 not in self.seen_addresses and ADDR_EMS_366 not in self.seen_addresses) or (rpm_flag and self.engine_rpm <= 0.0):
         self.engine_rpm = rpm
+    elif address == ADDR_ESP12 and len(data) >= 5:
+      raw_la = int(extract_intel(data, 13, 11))
+      if raw_la != 0x7FF:
+        self.long_accel_mps2 = float(raw_la * 0.01 - 10.23)
+      self.brake_cyl_press = float(extract_intel(data, 26, 12, scale=0.1))
+    elif address == ADDR_E_EMS11 and len(data) >= 8:
+      self.e_ems11_brake_pos = int(extract_intel(data, 0, 8))
+      self.ig_reactive_stat = int(extract_intel(data, 8, 3))
+      raw_acc = int(extract_intel(data, 31, 8))
+      raw_vcu = int(extract_intel(data, 56, 8))
+      acc_pct = (raw_acc / 254.0 * 100.0) if raw_acc < 0xFF else 0.0
+      vcu_pct = (raw_vcu / 254.0 * 100.0) if raw_vcu < 0xFF else 0.0
+      self.accel_pedal_raw = float(raw_acc)
+      self.vcu_accel_pedal_raw = float(raw_vcu)
+      self.gas_pedal_pct = round(min(100.0, max(0.0, acc_pct, vcu_pct)), 1)
+    elif address == ADDR_ELECT_GEAR and len(data) >= 3:
+      self.gear_shifter_raw = int(extract_intel(data, 16, 4))
+    elif address == ADDR_TCS13 and len(data) >= 7:
+      raw_ab = int(extract_intel(data, 0, 11))
+      if raw_ab != 0x7FF:
+        self.tcs_a_basis_mps2 = float(raw_ab * 0.01 - 10.23)
+      self.tcs_brake_light = bool(extract_intel(data, 11, 1))
+      self.tqi_scc_pct = float(extract_intel(data, 24, 8, scale=0.390625))
+      self.tcs_driver_override = int(extract_intel(data, 45, 2))
+      self.tcs_acc_req = bool(extract_intel(data, 54, 1))
+      self.tcs_driver_braking = bool(extract_intel(data, 55, 1))
+    elif address == ADDR_SCC12 and len(data) >= 7:
+      self.scc_acc_mode = int(extract_intel(data, 13, 2))
+      raw_req = int(extract_intel(data, 37, 11))
+      if raw_req != 0x7FF:
+        self.scc_a_req_mps2 = float(raw_req * 0.01 - 10.23)
     elif address == ADDR_EMS12 and len(data) >= 2:
       raw_coolant = int(extract_intel(data, 8, 8))
       if raw_coolant not in (0xFE, 0xFF):
@@ -337,7 +546,21 @@ class IoniqCanState:
       rl = float(extract_intel(data, 32, 14, scale=0.03125))
       rr = float(extract_intel(data, 48, 14, scale=0.03125))
       self.wheel_speeds_kph = (fl, fr, rl, rr)
-      self.wheel_speed_kph = (fl + fr + rl + rr) * 0.25
+      avg_kph = (fl + fr + rl + rr) * 0.25
+      self.wheel_speed_kph = avg_kph
+      if self._prev_wheel_ts is not None and self._prev_wheel_speed_kph is not None:
+        dt_w = ts - self._prev_wheel_ts
+        if 0.04 <= dt_w <= 1.2:
+          inst_a = max(-6.0, min(5.0, ((avg_kph - self._prev_wheel_speed_kph) / 3.6) / dt_w))
+          self.wheel_accel_mps2 = inst_a if self.wheel_accel_mps2 is None else (0.35 * inst_a + 0.65 * self.wheel_accel_mps2)
+          self._prev_wheel_speed_kph = avg_kph
+          self._prev_wheel_ts = ts
+        elif dt_w > 1.2:
+          self._prev_wheel_speed_kph = avg_kph
+          self._prev_wheel_ts = ts
+      else:
+        self._prev_wheel_speed_kph = avg_kph
+        self._prev_wheel_ts = ts
     elif address == ADDR_BAT11 and len(data) >= 8:
       self.bat_12v_invalid = bool(extract_intel(data, 55, 1))
       self.bat_12v_error = bool(extract_intel(data, 63, 1))
@@ -403,13 +626,23 @@ class IoniqCanState:
   def summary(self) -> dict:
     bat_health = self.battery_12v_health()
     thermal = self.thermal_status()
+    has_direct_rpm = self.has_direct_engine_rpm()
+    effective_rpm = self.engine_rpm if has_direct_rpm else self.synthetic_engine_rpm
+    unit_label = self.cluster_avg_fc_unit_label()
     return {
       'lastUpdateS': round(self.last_update_s, 3),
       'ignitionOn': self.ignition_on,
       'speedKph': round(self.best_speed_kph(), 1),
-      'engineRpm': round(self.engine_rpm, 0),
+      'engineRpm': round(effective_rpm, 0),
+      'hasDirectRpm': has_direct_rpm,
       'engineFiring': self.engine_is_firing(),
       'torquePct': round(max(self.engine_torque_pct, self.tqi_b_pct), 1),
+      'gasPedalPct': round(self.gas_pedal_pct, 1),
+      'tractivePowerKw': round(self.tractive_power_kw(), 1),
+      'gearShifter': self.gear_shifter_label(),
+      'isBraking': self.is_braking_or_regen(),
+      'wheelAccelMps2': None if self.wheel_accel_mps2 is None else round(self.wheel_accel_mps2, 2),
+      'instantFuelRateLph': round(self.instant_fuel_rate_lph, 2),
       'coolantTempC': thermal['coolantTempC'],
       'intakeAirTempC': thermal['intakeAirTempC'],
       'fuelTempC': thermal['fuelTempC'],
@@ -420,8 +653,10 @@ class IoniqCanState:
       'fuelDispPct': None if self.fuel_disp_level is None else round(min(100.0, max(0.0, self.fuel_disp_level / 31.0 * 100.0)), 1),
       'lowFuelWarn': self.low_fuel_warn,
       'dteKm': self.dte_km,
+      'clusterAvgFc': self.cluster_avg_fc_value,
       'clusterAvgFcValue': self.cluster_avg_fc_value,
       'clusterAvgFcUnit': self.cluster_avg_fc_unit,
+      'clusterAvgFcUnitLabel': unit_label,
       'bat12vVoltageV': bat_health['voltageV'],
       'bat12vSocPct': self.bat_12v_soc_pct,
       'bat12vSohPct': self.bat_12v_soh_pct,

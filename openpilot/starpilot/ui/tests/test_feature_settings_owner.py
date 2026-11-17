@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from openpilot.common.params import Params
+from openpilot.common.params import ParamKeyFlag, Params
 from openpilot.starpilot.longitudinal.profile_document import migrate_profile_document
 from openpilot.starpilot.ui.feature_settings_owner import FeatureSettingsOwner
 from openpilot.starpilot.ui.feature_settings_state import FeatureRow, FeatureSettingsRequest, row_change, row_default
@@ -646,6 +646,25 @@ class FeatureSettingsOwnerTests(unittest.TestCase):
     self.assertTrue(self.params.get_bool("ShowSpeedLimits"))
     self.assertFalse(self.params.get_bool("SpeedLimitController"))
     self.assertFalse(self.owner.apply(request))
+
+  def test_use_vienna_preference_and_clear_all_persistence(self):
+    self.fingerprint = None
+    self.owner = FeatureSettingsOwner(self.params, lambda group: self.allowed and group == "preferences",
+                                      vehicle_fingerprint=lambda: self.fingerprint)
+    page = self.owner.snapshot("slc", parked=False, system_long=False, lateral_context=False, metric=False)
+    vienna_row = next(row for row in page.rows if row.key == "UseVienna")
+    self.assertEqual((vienna_row.value, vienna_row.default_value), ("Off", "Off"))
+    self.assertTrue(vienna_row.available)
+    self.assertIsNone(vienna_row.vehicle_fingerprint)
+    request = required_change(vienna_row)
+    self.allowed = False
+    self.assertFalse(self.owner.apply(request))
+    self.allowed = True
+    self.assertTrue(self.owner.apply(request))
+    self.assertTrue(self.params.get_bool("UseVienna"))
+    self.params.clear_all(ParamKeyFlag.CLEAR_ON_ONROAD_TRANSITION)
+    self.params.clear_all(ParamKeyFlag.CLEAR_ON_IGNITION_ON)
+    self.assertTrue(self.params.get_bool("UseVienna"))
 
   def test_curve_saved_choices_and_invalid_learning(self):
     hub = self.owner.snapshot("hub", parked=True, system_long=True, lateral_context=True, metric=False)

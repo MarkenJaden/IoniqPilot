@@ -110,3 +110,11 @@ test('IoniqToolsPage exposes standalone Tools layout and handles mode transition
   assert.equal(aborted, 1)
   assert.equal(ctx.generation, 1)
 })
+
+test('IoniqToolsPage supports hev_model source label and corrected live summary bindings', () => {
+  assert.equal(IoniqToolsPage.methods.sourceLabel('hev_model'), 'HEV C-CAN Modell')
+  assert.match(IoniqToolsPage.template, /clusterAvgFcValue/)
+  assert.match(IoniqToolsPage.template, /clusterAvgFcUnitLabel/)
+  assert.match(IoniqToolsPage.template, /sourceDiag\.instantFuelRateLph/)
+  assert.match(IoniqToolsPage.template, /HEV-Modell \/ Kennfeld/)
+})

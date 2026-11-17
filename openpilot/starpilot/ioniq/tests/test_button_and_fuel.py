@@ -467,6 +467,155 @@ class TestButtonAndFuel(unittest.TestCase):
       ctrl.step([], mono_s=2.0, wall_time=201.0)
       self.assertAlmostEqual(ctrl.fuel.calibration_factor, 1.08)
 
+  def test_hev_c_can_mixed_drive_without_ems11_or_clu13(self) -> None:
+    from openpilot.starpilot.ioniq.can_signals import (
+      ADDR_ELECT_GEAR,
+      ADDR_ESP12,
+      ADDR_E_EMS11,
+      ADDR_SCC12,
+      ADDR_TCS13,
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+      tracker = FuelTripTracker(tmp, price_per_liter=1.80)
+      st = IoniqCanState()
+      t = 0.0
+
+      def step_drive(speed_kph: float, gas_raw: int, brake: bool = False, gear: int = 5, acc_mode: int = 0) -> None:
+        raw_spd = int(round(speed_kph / 0.03125))
+        st.apply_frame(t, ADDR_WHL_SPD11, encode_intel([(0, 14, raw_spd), (16, 14, raw_spd), (32, 14, raw_spd), (48, 14, raw_spd)]), bus=0)
+        st.apply_frame(t, ADDR_E_EMS11, encode_intel([(0, 8, 20 if brake else 0), (8, 3, 2), (31, 8, gas_raw), (56, 8, gas_raw)]), bus=0)
+        st.apply_frame(t, ADDR_ELECT_GEAR, encode_intel([(16, 4, gear)]), bus=0)
+        st.apply_frame(t, ADDR_TCS13, encode_intel([(11, 1, 1 if brake else 0), (55, 1, 1 if brake else 0)]), bus=0)
+        st.apply_frame(t, ADDR_ESP12, encode_intel([(13, 11, 1023), (26, 12, 250 if brake else 0)]), bus=0)
+        st.apply_frame(t, ADDR_SCC12, encode_intel([(13, 2, acc_mode), (37, 11, 1023)]), bus=0)
+        st.apply_frame(t, ADDR_CLU13, encode_intel([(3, 2, 1), (6, 10, 0), (18, 5, 22), (24, 10, 520)]), bus=0)
+        tracker.update(st, t, wall_time=50000.0 + t, ignition_hint=True)
+
+      # Phase 1: Accelerate 0 -> 55 km/h over 12s (gas ~35%)
+      for i in range(1, 25):
+        t = i * 0.5
+        step_drive(min(55.0, i * 2.3), gas_raw=90)
+      # Phase 2: Steady light city cruise @ 45 km/h for 45s (transitions into EV mode)
+      for _ in range(90):
+        t += 0.5
+        step_drive(45.0, gas_raw=20)
+      # Phase 3: Regen braking 45 -> 0 km/h over 8s
+      for i in range(16):
+        t += 0.5
+        step_drive(max(0.0, 45.0 - (i + 1) * 2.8), gas_raw=0, brake=True)
+      # Phase 4: Highway ramp & 115 km/h cruise over 60s
+      for i in range(20):
+        t += 0.5
+        step_drive(min(115.0, i * 5.8), gas_raw=120)
+      for _ in range(100):
+        t += 0.5
+        step_drive(115.0, gas_raw=52, acc_mode=1)
+
+      # Ignition off ends the trip cleanly
+      for i in range(6):
+        t += 0.5
+        st.apply_frame(t, ADDR_WHL_SPD11, encode_intel([(0, 14, 0), (16, 14, 0), (32, 14, 0), (48, 14, 0)]), bus=0)
+        st.apply_frame(t, ADDR_ELECT_GEAR, encode_intel([(16, 4, 0)]), bus=0)
+        tracker.update(st, t, wall_time=50000.0 + t, ignition_hint=False)
+
+      snap = tracker.snapshot(st)
+      self.assertIsNone(snap['activeTrip'])
+      self.assertEqual(len(snap['trips']), 1)
+      archived = snap['trips'][0]
+      self.assertEqual(archived['sourceMode'], 'hev_model')
+      self.assertGreater(archived['distanceKm'], 2.0)
+      self.assertGreater(archived['fuelLiters'], 0.08)
+      self.assertGreaterEqual(archived['avgLPer100Km'], 3.0)
+      self.assertLessEqual(archived['avgLPer100Km'], 9.0)
+      self.assertGreaterEqual(archived['evTimePct'], 10.0)
+      self.assertLessEqual(archived['evTimePct'], 85.0)
+      self.assertGreater(archived['evDistanceKm'], 0.05)
+      self.assertGreater(archived['iceDistanceKm'], 0.5)
+      self.assertGreater(snap['currentTank']['estimatedFuelLiters'], 0.08)
+      self.assertGreater(snap['currentTank']['iceDistanceKm'], 0.5)
+
+  def test_read_fuel_state_repairs_broken_zero_fuel_records(self) -> None:
+    from openpilot.starpilot.ioniq.fuel_tracker import write_fuel_state
+    with tempfile.TemporaryDirectory() as tmp:
+      broken_state = {
+        'activeTrip': None,
+        'trips': [
+          {
+            'id': 'trip_broken_1',
+            'startedAt': 2000.0,
+            'endedAt': 2900.0,
+            'durationS': 900.0,
+            'distanceKm': 12.4,
+            'evDistanceKm': 12.4,
+            'iceDistanceKm': 0.0,
+            'evDurationS': 900.0,
+            'iceDurationS': 0.0,
+            'evTimePct': 100.0,
+            'fuelLiters': 0.0,
+            'avgLPer100Km': 0.0,
+            'avgKmPerL': None,
+            'estimatedCostEur': 0.0,
+            'sourceMode': 'torque_model',
+          }
+        ],
+        'currentTank': {
+          'id': 'tank_1',
+          'startedAt': 1000.0,
+          'distanceKm': 12.4,
+          'estimatedFuelLiters': 0.0,
+          'partialRefuelsLiters': 0.0,
+          'evDistanceKm': 12.4,
+          'iceDistanceKm': 0.0,
+          'tripCount': 1,
+        },
+        'tankHistory': [],
+        'refuelLog': [],
+        'refuelAlert': None,
+        'calibrationFactor': 1.0,
+        'pendingFuelJump': None,
+      }
+      write_fuel_state(broken_state, tmp)
+
+      repaired = FuelTripTracker(tmp)
+      trip = repaired.state['trips'][0]
+      self.assertEqual(trip['sourceMode'], 'hev_model')
+      self.assertGreater(trip['fuelLiters'], 0.4)
+      self.assertGreaterEqual(trip['avgLPer100Km'], 4.0)
+      self.assertLessEqual(trip['avgLPer100Km'], 6.5)
+      self.assertLess(trip['evTimePct'], 90.0)
+      self.assertGreater(trip['iceDistanceKm'], 2.0)
+      self.assertGreater(repaired.state['currentTank']['estimatedFuelLiters'], 0.4)
+      self.assertGreater(repaired.state['currentTank']['iceDistanceKm'], 2.0)
+
+      # Reload verifies auto-repaired data was persisted cleanly to fuel.json
+      reloaded = FuelTripTracker(tmp)
+      self.assertAlmostEqual(reloaded.state['trips'][0]['fuelLiters'], trip['fuelLiters'])
+
+  def test_runtime_controller_feeds_car_state_and_live_summary_flow(self) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+      params = MemoryParams()
+      ctrl = IoniqRuntimeController(root=tmp, params_obj=params)
+      cs = SimpleNamespace(
+        vEgo=20.0,
+        aEgo=0.8,
+        gasPressed=True,
+        brakePressed=False,
+        standstill=False,
+        gearShifter='drive',
+        cruiseState=SimpleNamespace(enabled=False),
+      )
+      res = ctrl.step([], mono_s=1.0, wall_time=100.0, ignition_hint=True, car_state_msg=cs)
+      res2 = ctrl.step([], mono_s=3.5, wall_time=102.5, ignition_hint=True, car_state_msg=cs)
+      self.assertAlmostEqual(res2['live']['speedKph'], 72.0)
+      self.assertEqual(res2['live']['gearShifter'], 'D')
+      self.assertGreater(res2['fuel']['activeTrip']['fuelLiters'], 0.0)
+      self.assertEqual(res2['fuel']['activeTrip']['sourceMode'], 'hev_model')
+      diag = read_diagnostics_state(tmp)
+      self.assertIn('clusterAvgFc', diag['liveSummary'])
+      self.assertIn('clusterAvgFcUnitLabel', diag['liveSummary'])
+      self.assertGreater(diag['liveSummary']['instantFuelRateLph'], 0.0)
+      self.assertTrue(res is not None)
+
 
 if __name__ == '__main__':
   unittest.main()

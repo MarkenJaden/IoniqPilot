@@ -109,6 +109,11 @@ def _copy_string(value):
   return ctypes.string_at(value.data, value.size)
 
 
+SUPPLEMENTARY_KEYS = {
+  b"UseVienna": (ParamKeyFlag.PERSISTENT, ParamKeyType.BOOL, b"0"),
+}
+
+
 class UnknownKeyName(Exception):
   pass
 
@@ -125,11 +130,20 @@ class Params:
     return (type(self), (self.d,))
 
   def clear_all(self, tx_flag=ParamKeyFlag.ALL):
-    params_clear_all(self.p, int(tx_flag))
+    flag_mask = int(tx_flag)
+    preserved = {}
+    for key, (key_flag, _key_type, _default_val) in SUPPLEMENTARY_KEYS.items():
+      if not params_check_key(self.p, key) and not (int(key_flag) & flag_mask):
+        val = self.get(key)
+        if val is not None:
+          preserved[key] = val
+    params_clear_all(self.p, flag_mask)
+    for key, val in preserved.items():
+      self.put(key, val, block=True)
 
   def check_key(self, key):
     key = ensure_bytes(key)
-    if b"\0" in key or not params_check_key(self.p, key):
+    if b"\0" in key or (not params_check_key(self.p, key) and key not in SUPPLEMENTARY_KEYS):
       raise UnknownKeyName(key)
     return key
 
@@ -149,6 +163,8 @@ class Params:
       return self._cpp2python(t, default, None, key)
 
   def _default(self, key):
+    if not params_check_key(self.p, key) and key in SUPPLEMENTARY_KEYS:
+      return SUPPLEMENTARY_KEYS[key][2]
     return _copy_string(params_get_default(self.p, key))
 
   def get(self, key, block=False, return_default=False):
@@ -185,12 +201,18 @@ class Params:
     return _copy_string(params_get_path(self.p, key, len(key))).decode()
 
   def get_type(self, key):
-    return ParamKeyType(params_get_key_type(self.p, self.check_key(key)))
+    key = self.check_key(key)
+    if not params_check_key(self.p, key) and key in SUPPLEMENTARY_KEYS:
+      return SUPPLEMENTARY_KEYS[key][1]
+    return ParamKeyType(params_get_key_type(self.p, key))
 
   def all_keys(self):
     keys = []
     for i in range(params_keys_size(self.p)):
       keys.append(_copy_string(params_key_at(self.p, i)))
+    for key in SUPPLEMENTARY_KEYS:
+      if key not in keys:
+        keys.append(key)
     return keys
 
   def get_default_value(self, key):

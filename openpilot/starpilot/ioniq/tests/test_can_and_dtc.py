@@ -10,12 +10,18 @@ from openpilot.starpilot.ioniq.can_signals import (
   ADDR_BAT11,
   ADDR_CLU12,
   ADDR_CLU13,
+  ADDR_ELECT_GEAR,
   ADDR_EMS11,
   ADDR_EMS12,
   ADDR_EMS14,
   ADDR_EMS20,
+  ADDR_EMS_DCT11,
   ADDR_EMS_H12,
+  ADDR_ESP12,
+  ADDR_E_EMS11,
+  ADDR_SCC12,
   ADDR_TCU14,
+  ADDR_TCS13,
   ADDR_WHL_SPD11,
   IoniqCanState,
 )
@@ -350,6 +356,37 @@ class TestCanAndDtc(unittest.TestCase):
       st.apply_frame(6.0, ADDR_CLU13, encode_intel([(3, 2, 1), (6, 10, 0)]), bus=0)
       snap2 = tracker.update(st, 6.0, wall_time=1005.0)
       self.assertEqual(snap2['activeTrip']['clusterAvgLPer100Km'], 7.4)
+
+  def test_hev_c_can_signals_and_tractive_power(self) -> None:
+    st = IoniqCanState()
+    # C-CAN only (no EMS11/EMS_DCT11): WHL_SPD11 + E_EMS11 + ELECT_GEAR + TCS13 + ESP12 + SCC12
+    spd1 = int(round(36.0 / 0.03125))
+    spd2 = int(round(43.2 / 0.03125))
+    st.apply_frame(1.0, ADDR_WHL_SPD11, encode_intel([(0, 14, spd1), (16, 14, spd1), (32, 14, spd1), (48, 14, spd1)]), bus=0)
+    st.apply_frame(1.5, ADDR_WHL_SPD11, encode_intel([(0, 14, spd2), (16, 14, spd2), (32, 14, spd2), (48, 14, spd2)]), bus=0)
+    st.apply_frame(1.5, ADDR_E_EMS11, encode_intel([(0, 8, 0), (8, 3, 2), (31, 8, 127), (56, 8, 127)]), bus=0)
+    st.apply_frame(1.5, ADDR_ELECT_GEAR, encode_intel([(16, 4, 5)]), bus=0)
+    st.apply_frame(1.5, ADDR_TCS13, encode_intel([(11, 1, 0), (55, 1, 0)]), bus=0)
+    st.apply_frame(1.5, ADDR_ESP12, encode_intel([(13, 11, 1023), (26, 12, 0)]), bus=0)
+    st.apply_frame(1.5, ADDR_SCC12, encode_intel([(13, 2, 1), (37, 11, 1123)]), bus=0)
+
+    self.assertFalse(st.has_direct_engine_rpm())
+    self.assertEqual(st.gear_shifter_label(), 'D')
+    self.assertAlmostEqual(st.gas_pedal_pct, 50.0)
+    self.assertFalse(st.is_braking_or_regen())
+    self.assertGreater(st.wheel_accel_mps2 or 0.0, 1.0)
+    self.assertGreater(st.tractive_power_kw(), 15.0)
+
+    # Braking flag from TCS13 / ESP12
+    st.apply_frame(2.0, ADDR_TCS13, encode_intel([(11, 1, 1), (55, 1, 1)]), bus=0)
+    self.assertTrue(st.is_braking_or_regen())
+
+    # EMS_DCT11 provides direct RPM when present
+    st2 = IoniqCanState()
+    st2.apply_frame(1.0, ADDR_EMS_DCT11, encode_intel([(0, 8, 100), (14, 1, 1), (16, 16, 8400), (48, 8, 96)]), bus=0)
+    self.assertTrue(st2.has_direct_engine_rpm())
+    self.assertAlmostEqual(st2.engine_rpm, 2100.0)
+    self.assertTrue(st2.engine_is_firing())
 
 
 if __name__ == '__main__':

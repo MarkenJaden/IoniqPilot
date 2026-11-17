@@ -786,6 +786,8 @@ class StarShellSession:
       return self._save_aol(request)
     ok = self.feature_owner.apply(request)
     self._snapshot_cache = None
+    if ok and request.key in ("ShowSpeedLimits", "UseVienna", "ShowCSCStatus"):
+      self.adapter.invalidate_appearance()
     if not ok:
       self._unavailable("Saved conditional choice may have changed; refresh settings" if
                         request.key.startswith("conditional:") else

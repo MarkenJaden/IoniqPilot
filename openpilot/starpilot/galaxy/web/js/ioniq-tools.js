@@ -129,6 +129,7 @@ export const IoniqToolsPage = {
         fco_can: "CAN Einspritzung",
         obd_pid: "OBD-II Live",
         torque_model: "Kennfeld-Modell",
+        hev_model: "HEV C-CAN Modell",
         cluster_avg_fci: "Tacho-Referenz",
       }[mode] || mode || "Bereit"
     },
@@ -367,8 +368,8 @@ export const IoniqToolsPage = {
               </div>
               <div class="gx-ioniq__kpi">
                 <span class="gx-ioniq__kpi-label">Tacho-Bordcomputer</span>
-                <strong class="gx-ioniq__kpi-val">{{ formatNum(liveSummary.clusterAvgFc, 1) }}</strong>
-                <span class="gx-ioniq__kpi-sub">{{ liveSummary.clusterAvgFcUnit || 'L/100km' }} (CLU13)</span>
+                <strong class="gx-ioniq__kpi-val">{{ formatNum(liveSummary.clusterAvgFc ?? liveSummary.clusterAvgFcValue ?? activeTrip?.clusterAvgLPer100Km ?? activeTrip?.avgLPer100Km ?? currentTank.estimatedLPer100Km, 1) }}</strong>
+                <span class="gx-ioniq__kpi-sub">{{ liveSummary.clusterAvgFcUnitLabel || 'L/100km' }} ({{ (liveSummary.clusterAvgFc ?? liveSummary.clusterAvgFcValue) != null ? 'CLU13' : 'HEV-Modell' }})</span>
               </div>
               <div class="gx-ioniq__kpi">
                 <span class="gx-ioniq__kpi-label">Tank-Distanz</span>
@@ -421,7 +422,7 @@ export const IoniqToolsPage = {
                 <div class="gx-ioniq__stat"><span>Verbrauch</span><strong>{{ formatNum(activeTrip.fuelLiters, 2, ' L') }}</strong></div>
                 <div class="gx-ioniq__stat"><span>Ø Verbrauch</span><strong>{{ formatNum(activeTrip.avgLPer100Km, 2, ' L/100km') }}</strong></div>
                 <div class="gx-ioniq__stat"><span>Tacho-Ø</span><strong>{{ formatNum(activeTrip.clusterAvgLPer100Km ?? activeTrip.clusterAvgFci, 1, ' L/100km') }}</strong></div>
-                <div class="gx-ioniq__stat"><span>EV-Anteil</span><strong>{{ formatNum(activeTrip.evTimePct, 0, '%') }} Zeit</strong></div>
+                <div class="gx-ioniq__stat"><span>EV-Anteil</span><strong>{{ evSplitPct(activeTrip.evDistanceKm, activeTrip.iceDistanceKm, activeTrip.evTimePct) }}% Strecke · {{ formatNum(activeTrip.evTimePct, 0, '%') }} Zeit</strong></div>
               </div>
               <div class="gx-ioniq__card-foot">
                 <span>Geschätzt: {{ formatNum(activeTrip.estimatedCostEur, 2, ' €') }}</span>
@@ -438,8 +439,8 @@ export const IoniqToolsPage = {
               <div class="gx-ioniq__stats" style="margin-top: 10px">
                 <div class="gx-ioniq__stat"><span>Aktive Quelle</span><strong>{{ sourceDiag.activeSource || activeTrip?.sourceMode || 'Bereit' }}</strong></div>
                 <div class="gx-ioniq__stat"><span>FCO (EMS20)</span><strong>{{ sourceDiag.fcoValid ? formatNum(sourceDiag.fcoLiters, 3, ' L') : 'Inaktiv' }}</strong></div>
-                <div class="gx-ioniq__stat"><span>Kennfeld (EMS11)</span><strong>{{ formatNum(sourceDiag.modelLiters, 3, ' L') }}</strong></div>
-                <div class="gx-ioniq__stat"><span>Momentanfluss</span><strong>{{ formatNum(liveSummary.instantFuelRateLph, 2, ' L/h') }}</strong></div>
+                <div class="gx-ioniq__stat"><span>HEV-Modell / Kennfeld</span><strong>{{ formatNum(sourceDiag.modelLiters, 3, ' L') }}</strong></div>
+                <div class="gx-ioniq__stat"><span>Momentanfluss</span><strong>{{ formatNum(sourceDiag.instantFuelRateLph ?? activeTrip?.instantFuelRateLph ?? liveSummary.instantFuelRateLph, 2, ' L/h') }}</strong></div>
                 <div class="gx-ioniq__stat"><span>Tacho-Fallback</span><strong>{{ formatNum(sourceDiag.clusterFallbackLiters, 3, ' L') }}</strong></div>
                 <div class="gx-ioniq__stat"><span>Motordrehzahl</span><strong>{{ formatNum(liveSummary.engineRpm, 0, ' U/min') }}</strong></div>
               </div>
@@ -459,7 +460,7 @@ export const IoniqToolsPage = {
               <div class="gx-ioniq__stats">
                 <div class="gx-ioniq__stat"><span>Distanz / Dauer</span><strong>{{ formatNum(trip.distanceKm, 2, ' km') }} · {{ formatDuration(trip.durationS) }}</strong></div>
                 <div class="gx-ioniq__stat"><span>Menge / Kosten</span><strong>{{ formatNum(trip.fuelLiters, 2, ' L') }} · {{ formatNum(trip.estimatedCostEur, 2, ' €') }}</strong></div>
-                <div class="gx-ioniq__stat"><span>EV / Tacho-Ø</span><strong>{{ formatNum(trip.evTimePct, 0, '%') }} · {{ formatNum(trip.clusterAvgLPer100Km ?? trip.clusterAvgFci, 1, ' L') }}</strong></div>
+                <div class="gx-ioniq__stat"><span>EV / Tacho-Ø</span><strong>{{ evSplitPct(trip.evDistanceKm, trip.iceDistanceKm, trip.evTimePct) }}% ({{ formatNum(trip.evTimePct, 0, '%') }}t) · {{ formatNum(trip.clusterAvgLPer100Km ?? trip.clusterAvgFci ?? trip.avgLPer100Km, 1, ' L') }}</strong></div>
               </div>
               <div class="gx-ioniq__card-foot">
                 <span>Quelle: {{ sourceLabel(trip.sourceMode) }}</span>

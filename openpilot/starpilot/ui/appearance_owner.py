@@ -24,7 +24,6 @@ LABELS = {
   "LeadInfo": "Lead Info",
   "SignalMetrics": "C4 amber signal border",
   "BlindSpotMetrics": "C4 red blind-spot border",
-  "UseVienna": "Vienna Signs",
 }
 
 
@@ -38,7 +37,7 @@ class AppearanceOwner:
     compact_only = ("StockConfidenceBallWidget", "DriverCamera", "HideLeadMarker", "LeadInfo")
     keys = tuple(key for key in DEFAULTS if key not in compact_only and key in LABELS) if profile == Profile.LARGE else \
       ("DriverCamera", "StockConfidenceBallWidget", "HidePersonalityAlerts", "ShowBrakeStatus",
-       "HideLeadMarker", "LeadInfo", "SignalMetrics", "BlindSpotMetrics", "UseVienna")
+       "HideLeadMarker", "LeadInfo", "SignalMetrics", "BlindSpotMetrics")
     if profile == Profile.COMPACT and include_large:
       keys = ("DeveloperSidebar", *keys)
     rows = []

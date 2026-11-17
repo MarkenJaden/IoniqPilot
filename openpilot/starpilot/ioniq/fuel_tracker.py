@@ -43,6 +43,83 @@ def default_tank(now: float | None = None, odometer_km: float | None = None,
   }
 
 
+def _repair_broken_zero_fuel_records(state: dict[str, Any]) -> bool:
+  """Backfill previously recorded trips/tank cycles stuck at 0 L / 100% EV from missing EMS11 on C-CAN."""
+  changed = False
+  records: list[dict[str, Any]] = []
+  if isinstance(state.get('activeTrip'), dict):
+    records.append(state['activeTrip'])
+  for trip in state.get('trips') or []:
+    if isinstance(trip, dict):
+      records.append(trip)
+
+  for trip in records:
+    dist = float(trip.get('distanceKm', 0.0) or 0.0)
+    if dist < 0.05:
+      continue
+    fuel = float(trip.get('fuelLiters', 0.0) or 0.0)
+    ev_pct = float(trip.get('evTimePct', 0.0) or 0.0)
+    ice_dist = float(trip.get('iceDistanceKm', 0.0) or 0.0)
+    if fuel > 0.0001 and not (ev_pct >= 99.5 and ice_dist <= 0.0):
+      continue
+
+    dur = max(1.0, float(trip.get('durationS', 60.0) or 60.0))
+    avg_kph = dist / (dur / 3600.0)
+    clu = trip.get('clusterAvgLPer100Km')
+    est_l100 = float(clu) if isinstance(clu, (int, float)) and 1.5 <= float(clu) <= 18.0 else (
+      4.6 if avg_kph < 55.0 else (4.9 if avg_kph < 95.0 else 5.6)
+    )
+    if fuel <= 0.0001:
+      repaired_fuel = round(dist * est_l100 / 100.0, 4)
+      trip['fuelLiters'] = repaired_fuel
+      trip['fuelLitersModel'] = repaired_fuel
+      trip['avgLPer100Km'] = round(est_l100, 2)
+      trip['avgKmPerL'] = round(100.0 / est_l100, 2) if est_l100 > 0.0 else None
+      trip['estimatedCostEur'] = round(repaired_fuel * 1.75, 2)
+      if trip.get('sourceMode') in (None, '', 'torque_model'):
+        trip['sourceMode'] = 'cluster_avg_fci' if isinstance(clu, (int, float)) and 1.5 <= float(clu) <= 18.0 else 'hev_model'
+      changed = True
+
+    if ev_pct >= 99.5 and ice_dist <= 0.0:
+      ev_dist_frac = 0.52 if avg_kph < 45.0 else (0.36 if avg_kph < 85.0 else 0.14)
+      ev_time_frac = min(0.88, ev_dist_frac + 0.12)
+      trip['evDistanceKm'] = round(dist * ev_dist_frac, 3)
+      trip['iceDistanceKm'] = round(dist * (1.0 - ev_dist_frac), 3)
+      trip['evDistancePct'] = round(ev_dist_frac * 100.0, 1)
+      trip['evDurationS'] = round(dur * ev_time_frac, 2)
+      trip['iceDurationS'] = round(dur * (1.0 - ev_time_frac), 2)
+      trip['evTimePct'] = round(ev_time_frac * 100.0, 1)
+      changed = True
+
+  tank = state.get('currentTank')
+  if isinstance(tank, dict):
+    tank_dist = float(tank.get('distanceKm', 0.0) or 0.0)
+    tank_fuel = float(tank.get('estimatedFuelLiters', 0.0) or 0.0)
+    tank_ice = float(tank.get('iceDistanceKm', 0.0) or 0.0)
+    if tank_dist >= 0.05 and (tank_fuel <= 0.0001 or tank_ice <= 0.0):
+      tank_start = float(tank.get('startedAt', 0.0) or 0.0)
+      matching_trips = [
+        t for t in records
+        if float(t.get('startedAt', 0.0) or 0.0) >= (tank_start - 5.0)
+      ]
+      sum_fuel = sum(float(t.get('fuelLiters', 0.0) or 0.0) for t in matching_trips)
+      sum_ev = sum(float(t.get('evDistanceKm', 0.0) or 0.0) for t in matching_trips)
+      sum_ice = sum(float(t.get('iceDistanceKm', 0.0) or 0.0) for t in matching_trips)
+      if tank_fuel <= 0.0001:
+        tank['estimatedFuelLiters'] = round(sum_fuel if sum_fuel > 0.001 else tank_dist * 4.8 / 100.0, 4)
+        changed = True
+      if tank_ice <= 0.0:
+        if (sum_ev + sum_ice) >= 0.05 and sum_ice > 0.0:
+          tank['evDistanceKm'] = round(sum_ev, 3)
+          tank['iceDistanceKm'] = round(sum_ice, 3)
+        else:
+          tank['evDistanceKm'] = round(tank_dist * 0.42, 3)
+          tank['iceDistanceKm'] = round(tank_dist * 0.58, 3)
+        changed = True
+
+  return changed
+
+
 def read_fuel_state(root: Path | str | None = None) -> dict[str, Any]:
   default: dict[str, Any] = {
     'activeTrip': None,
@@ -54,7 +131,8 @@ def read_fuel_state(root: Path | str | None = None) -> dict[str, Any]:
     'calibrationFactor': 1.0,
     'pendingFuelJump': None,
   }
-  data = read_json(fuel_path(root), default)
+  path = fuel_path(root)
+  data = read_json(path, default)
   if not isinstance(data, dict):
     return default
   for k, v in default.items():
@@ -67,6 +145,8 @@ def read_fuel_state(root: Path | str | None = None) -> dict[str, Any]:
     data['tankHistory'] = []
   if not isinstance(data.get('refuelLog'), list):
     data['refuelLog'] = []
+  if _repair_broken_zero_fuel_records(data) and path.exists():
+    write_fuel_state(data, root)
   return data
 
 
@@ -146,11 +226,16 @@ class FuelTripTracker:
     self._last_instant_lph: float = 0.0
     self._dirty: bool = False
     self._last_flush_mono_s: float = 0.0
+    self._hev_ev_debt_wh: float = 60.0
+    self._hev_ice_on: bool = False
+    self._hev_ice_hold_until_mono: float = 0.0
+    self._hev_ice_ever_fired: bool = False
 
     active = self.state.get('activeTrip')
     if isinstance(active, dict):
       self._integrated_distance_km = float(active.get('integratedDistanceKm', active.get('distanceKm', 0.0)))
       self._start_odometer_km = active.get('odometerStartKm')
+      self._hev_ice_ever_fired = float(active.get('fuelLiters', 0.0) or 0.0) > 0.001
 
   def _ensure_active_trip(self, can_state: IoniqCanState, mono_s: float, wall_time: float) -> dict[str, Any]:
     trip = self.state.get('activeTrip')
@@ -178,11 +263,12 @@ class FuelTripTracker:
       'fuelLitersModel': 0.0,
       'fuelLitersClusterFallback': 0.0,
       'instantFuelRateLph': 0.0,
-      'sourceMode': 'torque_model',
+      'sourceMode': 'torque_model' if can_state.has_direct_engine_rpm() else 'hev_model',
       'sourceDiagnostics': {},
       'avgLPer100Km': None,
       'avgKmPerL': None,
       'evTimePct': 0.0,
+      'evDistancePct': 0.0,
       'estimatedCostEur': 0.0,
       'clusterAvgFci': can_state.cluster_avg_fc_value,
       'clusterAvgLPer100Km': cluster_avg_l_per_100km(can_state),
@@ -200,6 +286,10 @@ class FuelTripTracker:
     self._last_fco_raw = can_state.fco_raw
     self._fco_valid_ticks = 0
     self._fco_rejected_ticks = 0
+    self._hev_ev_debt_wh = 60.0
+    self._hev_ice_on = False
+    self._hev_ice_hold_until_mono = mono_s
+    self._hev_ice_ever_fired = False
 
     tank = self.state['currentTank']
     if tank.get('startOdometerKm') is None and odo is not None:
@@ -217,11 +307,13 @@ class FuelTripTracker:
     has_clu12 = 0x5B0 in seen
     has_clu13 = 0x50C in seen
     has_whl_spd = 0x386 in seen
-    mode = (trip or {}).get('sourceMode', 'torque_model')
+    default_mode = 'torque_model' if can_state.has_direct_engine_rpm() else 'hev_model'
+    mode = (trip or {}).get('sourceMode', default_mode)
     mode_labels = {
       'fco_can': 'Direkte Einspritzmenge (EMS20 0x200 FCO)',
       'obd_pid': 'OBD-II Live-Sensorik (MAF / Fuel Rate)',
       'torque_model': 'Atkinson-Kennfeldmodell (EMS11 Drehzahl/Drehmoment)',
+      'hev_model': 'HEV Traktions-/Rekuperationsmodell (C-CAN)',
       'cluster_avg_fci': 'Kombiinstrument-Referenz (CLU13 Durchschnittsverbrauch)',
     }
     return {
@@ -234,12 +326,20 @@ class FuelTripTracker:
       'fcoRejectedTicks': self._fco_rejected_ticks,
       'ems11Seen': has_ems11,
       'emsH12Seen': has_ems_h12,
+      'eEms11Seen': 0x371 in seen,
+      'electGearSeen': 0x372 in seen,
+      'tcs13Seen': 0x394 in seen,
       'clu12OdoSeen': has_clu12,
       'clu13FuelSeen': has_clu13,
       'wheelSpeedSeen': has_whl_spd,
+      'hasDirectRpm': can_state.has_direct_engine_rpm(),
       'engineFiring': can_state.engine_is_firing(),
-      'engineRpm': round(can_state.engine_rpm, 0),
+      'engineRpm': round(can_state.engine_rpm if can_state.has_direct_engine_rpm() else can_state.synthetic_engine_rpm, 0),
       'torquePct': round(max(can_state.engine_torque_pct, can_state.tqi_b_pct), 1),
+      'gasPedalPct': round(can_state.gas_pedal_pct, 1),
+      'tractivePowerKw': round(can_state.tractive_power_kw(), 1),
+      'gearShifter': can_state.gear_shifter_label(),
+      'hevEvDebtWh': round(self._hev_ev_debt_wh, 1),
       'clusterAvgFci': can_state.cluster_avg_fc_value,
       'clusterAvgLPer100Km': cluster_avg_l_per_100km(can_state),
       'fcoValid': self._fco_valid_ticks >= 2,
@@ -252,19 +352,95 @@ class FuelTripTracker:
       'calibrationFactor': round(self.calibration_factor, 4),
     }
 
+  def _step_hev_model(self, can_state: IoniqCanState, trip: dict[str, Any], dt: float,
+                      mono_s: float, speed_kph: float) -> float:
+    """Power-split & HV battery energy-balance estimator when C-CAN omits direct ICE RPM."""
+    p_wheel = can_state.tractive_power_kw()
+    gas_pct = can_state.gas_pedal_pct
+    if can_state.cs_gas_pressed and gas_pct <= 1.0:
+      gas_pct = 18.0
+    gear = can_state.gear_shifter_label()
+    braking = can_state.is_braking_or_regen()
+    p_aux_kw = 0.65 + (0.85 if can_state.ac_relay_on else 0.0)
+    cold_coolant = can_state.coolant_temp_c is not None and can_state.coolant_temp_c < 48.0
+    initial_warmup = can_state.coolant_temp_c is None and float(trip.get('durationS', 0.0)) < 25.0 and speed_kph >= 10.0 and gas_pct >= 8.0
+    need_initial_fire = float(trip.get('distanceKm', 0.0)) >= 0.15 and not self._hev_ice_ever_fired and p_wheel >= 1.5 and gear != 'P'
+
+    trigger_ice = (
+      (gear == 'S' and (speed_kph > 5.0 or gas_pct > 4.0))
+      or p_wheel >= 11.5
+      or gas_pct >= 26.0
+      or (speed_kph >= 92.0 and p_wheel > 3.0)
+      or (self._hev_ev_debt_wh >= 210.0 and (speed_kph >= 10.0 or p_wheel > 1.5 or gas_pct > 4.0))
+      or ((cold_coolant or initial_warmup) and (speed_kph >= 5.0 or gas_pct > 3.0))
+      or need_initial_fire
+    )
+
+    if trigger_ice:
+      if not self._hev_ice_on:
+        self._hev_ice_on = True
+        self._hev_ice_hold_until_mono = mono_s + 7.0
+      self._hev_ice_ever_fired = True
+    elif self._hev_ice_on:
+      allow_release = mono_s >= self._hev_ice_hold_until_mono or (braking and p_wheel < -2.0 and speed_kph < 45.0)
+      if allow_release and not (gear == 'S' and speed_kph > 15.0) and not cold_coolant:
+        stopped_warm = speed_kph < 1.5 and self._hev_ev_debt_wh < 230.0
+        light_ev_cruise = p_wheel < 7.5 and speed_kph < 82.0 and gas_pct < 18.0 and self._hev_ev_debt_wh < 110.0
+        if stopped_warm or (braking and p_wheel < -0.8) or light_ev_cruise:
+          self._hev_ice_on = False
+
+    dfco = self._hev_ice_on and (
+      (braking and p_wheel < -0.8) or (p_wheel < -2.5 and gas_pct < 1.5 and speed_kph > 25.0)
+    ) and not cold_coolant
+
+    if not self._hev_ice_on or dfco:
+      if p_wheel < -0.5:
+        regen_kw = min(30.0, (-p_wheel) * 0.62)
+        self._hev_ev_debt_wh = max(-120.0, min(380.0, self._hev_ev_debt_wh - (regen_kw - p_aux_kw) * (dt / 3.6)))
+      else:
+        ev_batt_kw = (max(0.0, p_wheel) / 0.88) + p_aux_kw
+        self._hev_ev_debt_wh = min(380.0, self._hev_ev_debt_wh + ev_batt_kw * (dt / 3.6))
+      can_state.synthetic_engine_rpm = round(max(1100.0, 900.0 + speed_kph * 16.0), 0) if dfco else 0.0
+      can_state.synthetic_engine_firing = False
+      return 0.0
+
+    p_charge_kw = min(14.0, max(3.0, self._hev_ev_debt_wh * 0.055)) if self._hev_ev_debt_wh > 25.0 else 0.0
+    if p_wheel < -0.5:
+      regen_kw = min(25.0, (-p_wheel) * 0.58)
+      self._hev_ev_debt_wh = max(-120.0, self._hev_ev_debt_wh - (regen_kw + p_charge_kw * 0.88 - p_aux_kw) * (dt / 3.6))
+    else:
+      self._hev_ev_debt_wh = max(-80.0, self._hev_ev_debt_wh - (p_charge_kw * 0.88 - p_aux_kw) * (dt / 3.6))
+
+    p_ice_mech_kw = min(77.0, max(3.2, (max(0.0, p_wheel) / 0.90) + p_charge_kw + 0.6))
+    syn_rpm = max(1250.0, min(5200.0, 1250.0 + speed_kph * 18.0 + p_ice_mech_kw * 28.0))
+    eq_torque_pct = min(98.0, max(12.0, (p_ice_mech_kw * 9549.0 / syn_rpm) / MAX_ENGINE_TORQUE_NM * 100.0))
+    bsfc = estimate_bsfc_g_per_kwh(syn_rpm, eq_torque_pct, can_state.coolant_temp_c)
+    can_state.synthetic_engine_rpm = round(syn_rpm, 0)
+    can_state.synthetic_engine_firing = True
+    return max(0.55, (p_ice_mech_kw * bsfc) / GASOLINE_DENSITY_G_PER_L) * self.calibration_factor
+
   def update(self, can_state: IoniqCanState, mono_s: float, *, wall_time: float | None = None,
              ignition_hint: bool | None = None, force_flush: bool = False) -> dict[str, Any]:
     """Advance trip & tank accumulators with the latest CAN state."""
     now = wall_time if wall_time is not None else datetime.now(UTC).timestamp()
     speed_kph = can_state.best_speed_kph()
     ign = ignition_hint if ignition_hint is not None else can_state.ignition_on
-    driving_or_ready = bool(ign is True or speed_kph > 0.5 or can_state.engine_rpm > 200.0)
+    gear = can_state.gear_shifter_label()
+    driving_or_ready = bool(
+      ign is True
+      or speed_kph > 0.5
+      or can_state.engine_rpm > 200.0
+      or (ign is not False and gear in ('D', 'S', 'R'))
+    )
 
     if driving_or_ready:
       self._off_since_mono_s = None
       trip = self._ensure_active_trip(can_state, mono_s, now)
     else:
       self._last_instant_lph = 0.0
+      can_state.instant_fuel_rate_lph = 0.0
+      can_state.synthetic_engine_firing = False
+      can_state.synthetic_engine_rpm = 0.0
       if self.state.get('activeTrip') is not None:
         if ign is False:
           if self._off_since_mono_s is None:
@@ -295,19 +471,6 @@ class FuelTripTracker:
     else:
       self._stationary_duration_s = 0.0
 
-    # Time & hybrid split
-    trip['durationS'] = round(trip['durationS'] + dt, 2)
-    is_moving = speed_kph >= 0.8
-    firing = can_state.engine_is_firing()
-    if is_moving:
-      trip['movingDurationS'] = round(trip['movingDurationS'] + dt, 2)
-    else:
-      trip['idleDurationS'] = round(trip['idleDurationS'] + dt, 2)
-    if firing:
-      trip['iceDurationS'] = round(trip['iceDurationS'] + dt, 2)
-    else:
-      trip['evDurationS'] = round(trip['evDurationS'] + dt, 2)
-
     # Distance: integrate continuous speed + anchor to CLU12 odometer when delta >= 0.2 km
     ddist = max(0.0, speed_kph) * (dt / 3600.0)
     self._integrated_distance_km += ddist
@@ -332,6 +495,35 @@ class FuelTripTracker:
       trip['distanceKm'] = round(self._integrated_distance_km, 3)
       dist_inc = max(0.0, trip['distanceKm'] - prev_trip_dist)
 
+    # Evaluate HEV energy-balance model BEFORE computing firing / EV split when direct RPM is absent on C-CAN
+    has_direct_rpm = can_state.has_direct_engine_rpm()
+    has_obd_fuel = bool(
+      (can_state.obd_fuel_rate_lph is not None and can_state.obd_fuel_rate_lph > 0.05)
+      or (can_state.obd_maf_gps is not None and can_state.obd_maf_gps > 0.2)
+    )
+    if not has_direct_rpm and not has_obd_fuel:
+      instant_lph = self._step_hev_model(can_state, trip, dt, mono_s, speed_kph)
+    else:
+      if not has_direct_rpm and has_obd_fuel:
+        can_state.synthetic_engine_firing = True
+      instant_lph = estimate_fuel_rate_lph(can_state, calibration_factor=self.calibration_factor)
+    can_state.instant_fuel_rate_lph = instant_lph
+    self._last_instant_lph = instant_lph
+    trip['instantFuelRateLph'] = round(instant_lph, 2)
+
+    # Time & hybrid split
+    trip['durationS'] = round(trip['durationS'] + dt, 2)
+    is_moving = speed_kph >= 0.8
+    firing = can_state.engine_is_firing()
+    if is_moving:
+      trip['movingDurationS'] = round(trip['movingDurationS'] + dt, 2)
+    else:
+      trip['idleDurationS'] = round(trip['idleDurationS'] + dt, 2)
+    if firing:
+      trip['iceDurationS'] = round(trip['iceDurationS'] + dt, 2)
+    else:
+      trip['evDurationS'] = round(trip['evDurationS'] + dt, 2)
+
     if firing:
       trip['iceDistanceKm'] = round(trip['iceDistanceKm'] + dist_inc, 3)
       tank['iceDistanceKm'] = round(float(tank.get('iceDistanceKm', 0.0)) + dist_inc, 3)
@@ -343,13 +535,6 @@ class FuelTripTracker:
     if odo is not None:
       tank['lastOdometerKm'] = odo
 
-    # Multi-source fuel integration:
-    # 1. EMS20 0x200 FCO rolling counter (when valid delta observed)
-    # 2. OBD-II live PID / Atkinson torque-RPM physics model
-    # 3. CLU13 cluster average consumption * distance fallback (guarantees non-zero consumption when driving if EMS signals are absent)
-    instant_lph = estimate_fuel_rate_lph(can_state, calibration_factor=self.calibration_factor)
-    self._last_instant_lph = instant_lph
-    trip['instantFuelRateLph'] = round(instant_lph, 2)
     model_inc = instant_lph * (dt / 3600.0)
     trip['fuelLitersModel'] = round(float(trip.get('fuelLitersModel', 0.0)) + model_inc, 5)
 
@@ -383,15 +568,21 @@ class FuelTripTracker:
       step_inc = fco_inc if fco_step_valid else (model_inc if firing else 0.0)
       trip['fuelLiters'] = round(max(fco_total, prev_fuel_total + step_inc), 5)
       trip['sourceMode'] = 'fco_can'
-    elif model_total > 0.0001 or firing:
+    elif has_obd_fuel and (model_total > 0.0001 or firing):
       trip['fuelLiters'] = round(max(model_total, prev_fuel_total + model_inc), 5)
-      trip['sourceMode'] = 'obd_pid' if (can_state.obd_fuel_rate_lph or can_state.obd_maf_gps) else 'torque_model'
+      trip['sourceMode'] = 'obd_pid'
+    elif has_direct_rpm and (model_total > 0.0001 or firing):
+      trip['fuelLiters'] = round(max(model_total, prev_fuel_total + model_inc), 5)
+      trip['sourceMode'] = 'torque_model'
+    elif not has_direct_rpm and (model_total > 0.0001 or firing):
+      trip['fuelLiters'] = round(max(model_total, prev_fuel_total + model_inc), 5)
+      trip['sourceMode'] = 'hev_model'
     elif cluster_total > 0.0001:
       trip['fuelLiters'] = round(max(cluster_total, prev_fuel_total + cluster_inc), 5)
       trip['sourceMode'] = 'cluster_avg_fci'
     else:
       trip['fuelLiters'] = round(prev_fuel_total, 5)
-      trip['sourceMode'] = 'torque_model'
+      trip['sourceMode'] = 'torque_model' if has_direct_rpm else 'hev_model'
 
     fuel_inc = max(0.0, float(trip['fuelLiters']) - prev_fuel_total)
     tank['estimatedFuelLiters'] = round(float(tank.get('estimatedFuelLiters', 0.0)) + fuel_inc, 4)
@@ -724,8 +915,8 @@ class FuelTripTracker:
       self._build_source_diagnostics(can_state, active_trip)
       if can_state is not None
       else (active_trip.get('sourceDiagnostics') if isinstance(active_trip, dict) else {
-        'activeSource': 'torque_model',
-        'activeSourceLabel': 'Atkinson-Kennfeldmodell (Bereit)',
+        'activeSource': 'hev_model',
+        'activeSourceLabel': 'HEV C-CAN Modell (Bereit)',
         'instantFuelRateLph': round(self._last_instant_lph, 2),
         'calibrationFactor': round(self.calibration_factor, 4),
       })
