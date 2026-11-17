@@ -27,6 +27,8 @@ from openpilot.starpilot.gps.source import observation as gps_observation
 from openpilot.selfdrive.car.car_events import CarEvents
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 from openpilot.selfdrive.selfdrived.events import Events, ET, Alert, Priority as AlertPriority
+from openpilot.selfdrive.selfdrived.bookmarks import BookmarkCounter
+from openpilot.starpilot.bookmark_state import BookmarkCheckpoint
 from openpilot.starpilot.longitudinal.force_stop_alert import HoldAlertState, EVENT_TYPE as FORCE_STOP_HOLD
 from openpilot.selfdrive.selfdrived.helpers import (ExcessiveActuationCheck, jetlink_in_control, jetlink_lost_alert, throttled_param,
                                                     update_big_model_status, update_jetlink_swaps)
@@ -197,7 +199,7 @@ class SelfdriveD:
     self.sm = messaging.SubMaster(['deviceState', 'pandaStates', 'peripheralState', 'modelV2', 'extrinsicsCalibration',
                                    'carOutput', 'driverMonitoringState', 'longitudinalPlan', 'deviceMotion', 'lateralDelay',
                                    'managerState', 'vehicleParameters', 'radarState', 'lateralTorqueParameters',
-                                   'controlsState', 'carControl', 'driverAssistance', 'alertDebug', 'userBookmark',
+                                   'controlsState', 'carControl', 'driverAssistance', 'alertDebug',
                                    'lateralManeuverPlan', 'laneChangeAssistWire', 'starpilotLongitudinalPlan'] +
                                   (['aolIntentWire'] if self.aol_replay else []) +
                                    (['aolSafetyWire'] if self.axis_transport_required else []) +
@@ -205,6 +207,9 @@ class SelfdriveD:
                                    self.camera_packets + self.sensor_packets + self.gps_packets + radar_notifications,
                                   ignore_alive=ignore, ignore_avg_freq=ignore,
                                   ignore_valid=ignore, frequency=int(1/DT_CTRL))
+
+    # Event streams must not conflate: two quick bookmarks are two saved events.
+    self.bookmark_sock = messaging.sub_sock('userBookmark')
 
     # read params
     self.is_metric = self.params.get_bool("IsMetric")
@@ -223,7 +228,8 @@ class SelfdriveD:
     self.CS_prev = car.CarState.new_message()
     self.AM = AlertManager()
     from openpilot.starpilot.car.events import event_rules
-    self.events = Events(event_rules(self.CP))
+    self.bookmarks = BookmarkCounter(BookmarkCheckpoint())
+    self.events = Events(event_rules(self.CP) | self.bookmarks.event_rules())
 
     self.initialized = False
     self.initialized_frame = 0
@@ -372,10 +378,28 @@ class SelfdriveD:
         self.events.add(EventName.pedalPressed)
 
 
+  def _update_bookmarks(self):
+    # Run before initialization/dashcam early returns and independently of UI rendering.
+    # Only userBookmark represents a saved event; bookmarkButton is the same action.
+    if not hasattr(self, 'bookmarks') or not self.sm.seen['deviceState']:
+      return
+    count = 0
+    for _ in range(64):
+      bookmark = messaging.recv_one_or_none(self.bookmark_sock)
+      if bookmark is None:
+        break
+      count += 1
+    device = self.sm['deviceState']
+    if self.bookmarks.update(started=device.started, drive_id=int(device.startedMonoTime), bookmarks=count):
+      prime_type = self.params.get("PrimeType")
+      paired = prime_type is not None and int(prime_type) >= 0
+      self.events.add(EventName.userBookmark if paired else EventName.userBookmarkNotPaired)
+
   def update_events(self, CS):
     """Compute onroadEvents from carState"""
 
     self.events.clear()
+    self._update_bookmarks()
     self.car_event_sample_count = 0
     self.aol_reconciled_sources = ()
     self.tesla_stock_alerts = []
@@ -423,12 +447,6 @@ class SelfdriveD:
       self._update_steering_authority(CS)
       self.events.add(EventName.selfdriveInitializing)
       return
-
-    # Check for user bookmark press
-    if self.sm.updated['userBookmark']:
-      prime_type = self.params.get("PrimeType")
-      paired = prime_type is not None and int(prime_type) >= 0
-      self.events.add(EventName.userBookmark if paired else EventName.userBookmarkNotPaired)
 
     # Don't add any more events while in dashcam mode
     if self.CP.passive:

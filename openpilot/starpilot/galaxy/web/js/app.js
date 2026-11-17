@@ -1,3 +1,4 @@
+import { installDisclosureMotion } from './disclosure.js'
 import { startLocalization } from "./localization.js"
 import { rememberInstallPrompt } from "./install-app.js"
 import { toggleHaptic } from "./haptics.js"
@@ -5,6 +6,7 @@ import { GxState } from "./state.js"
 import { BottomNav, NAV, primaryTab } from "./bottom-nav.js"
 import { UpdateRestart } from "./update-restart.js"
 import { DeviceRestartWatch } from "./device-restart.js"
+import { AppDownloadReminder } from "./app-reminder.js"
 import { bootScreenMode, dismissBootScreen, showBootScreen, showRestartScreen } from "./boot-screen.js"
 import { GxNotice } from "./notice.js"
 import { createApp, reactive, defineAsyncComponent } from "../vendor/vue/vue.esm-browser.js"
@@ -12,6 +14,8 @@ import { route, navigate, navigateBack, ensureBackEntry, setRouteLeaveGuard, sta
 import { loadCatalog } from "./startup.js"
 import { Tools } from "./tools.js"
 window.addEventListener("beforeinstallprompt", rememberInstallPrompt)
+installDisclosureMotion()
+
 const Logs = page(() => import("./logs.js").then((module) => module.Logs))
 const SoftwarePage = page(() => import("./software-status.js").then((module) => module.SoftwarePage))
 const NavigationPage = page(() => import("./navigation.js").then((module) => module.NavigationPage))
@@ -87,7 +91,7 @@ const auth = new LocalAuth({ publish: (update) => {
 
 
 createApp({
-  components: { BottomNav, Home, LocalAccess, Tools, Logs, SoftwarePage, NavigationPage, ModelsPage, SettingsPage, SettingsRecoveryPage, ToggleSearch, SaveFeedback, FlmPage, LocalRecordingsPage, CamerasPage, SentryEventsPage, VasmPage, PipPage, DrivingPage, DevicePreferencesPage, BluetoothPage, IoniqToolsPage, StarPortPage, SpotifyPage, LongitudinalCurvesPage, OnroadLayoutPage, GalaxyPage, DevicePicker, DeviceState, MenuTile },
+  components: { AppDownloadReminder, BottomNav, Home, LocalAccess, Tools, Logs, SoftwarePage, NavigationPage, ModelsPage, SettingsPage, SettingsRecoveryPage, ToggleSearch, SaveFeedback, FlmPage, LocalRecordingsPage, CamerasPage, SentryEventsPage, VasmPage, PipPage, DrivingPage, DevicePreferencesPage, BluetoothPage, IoniqToolsPage, StarPortPage, SpotifyPage, LongitudinalCurvesPage, OnroadLayoutPage, GalaxyPage, DevicePicker, DeviceState, MenuTile },
   data: () => ({ state, authState, authForm, route, NAV, routeDirection: 1, updateRestart, deviceRestart, nextLayoutLeavePresentation: "inline" }),
   computed: {
     visibleTools() { return state.tools.filter(tool => tool.visibility !== "authenticated" ||
@@ -188,6 +192,7 @@ createApp({
   },
   template: `
     <div class="gx-app" :class="{'gx-nav-pinned':state.navPinned}" :inert="state.updateRestarting" @change.capture="toggleHaptic">
+      <AppDownloadReminder v-if="route.path === '/' && !state.loading && !state.updateRestarting && (state.monitorMode !== 'local' || authState.status === 'authenticated')" />
       <header class="gx-appbar">
         <button type="button" class="gx-icon-btn gx-appbar__back gx-back-btn" aria-label="Back" @click="routeBack"><i class="bi bi-arrow-left"></i></button>
         <div class="gx-appbar__pill">
