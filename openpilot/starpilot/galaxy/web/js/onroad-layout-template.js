@@ -73,6 +73,7 @@ export const ONROAD_LAYOUT_TEMPLATE = `
               <svg ref="preview" class="gx-layout__preview" :style="{'--layout-glow': state.profile === 'compact' ? '4px' : '14px'}" :viewBox="'0 0 ' + profile.width + ' ' + profile.height" :width="profile.width" :height="profile.height"
                 @pointermove="moveDrag" @pointerup="endDrag" @pointercancel="cancelDrag" @lostpointercapture="cancelDrag"
                 role="group" :aria-label="projection ? 'StarPort layout preview' : (state.profile === 'large' ? 'Big' : 'Small') + ' layout preview'">
+                <g id="gx-layout-stage">
                 <image v-if="nativeBackdropReady" :href="state.backdrop.url" :width="profile.width" :height="profile.height" preserveAspectRatio="none" data-preview-source="device-backdrop" />
                 <template v-else>
                 <rect width="100%" height="100%" fill="#252b32" />
@@ -160,8 +161,12 @@ export const ONROAD_LAYOUT_TEMPLATE = `
                     :y1="guide.axis === 'y' ? guide.value : 0" :y2="guide.axis === 'y' ? guide.value : profile.height" vector-effect="non-scaling-stroke" />
                 </g>
                 <rect v-if="state.showEditingAids && selectionBox" class="gx-layout__outline" :x="selectionBox.x" :y="selectionBox.y" :width="selectionBox.width" :height="selectionBox.height" rx="4" fill="none" stroke="#d4baff" stroke-width="2" vector-effect="non-scaling-stroke" />
+                </g>
               </svg>
               </div>
+              <Teleport to="body"><div v-if="loupe" class="gx-layout__loupe" aria-hidden="true" :style="loupe.style">
+                <svg :viewBox="loupe.viewBox" preserveAspectRatio="xMidYMid meet"><use href="#gx-layout-stage" /></svg>
+              </div></Teleport>
               <!-- The Small screen is too short to carry the chip over the layout; it sits underneath instead. -->
               <span v-if="!projection && state.showFavoriteZones && state.showEditingAids && state.profile === 'compact'" class="gx-layout__stage-chip gx-layout__stage-chip--below" aria-hidden="true"><i class="bi bi-grid-3x3-gap"></i>Tap areas</span>
               <GxCollapse><div v-show="state.tipsOpen" id="gx-layout-tips" class="gx-layout__tips">
@@ -170,7 +175,7 @@ export const ONROAD_LAYOUT_TEMPLATE = `
               <p class="gx-note">General edit shows samples of all enabled widgets together. Driving scenes hide widgets that would be absent, and the eyes follow the scene. Eye changes stay with that scene; your General edit eyes are remembered.</p>
               <p v-if="selectedWidget?.kind === 'weather'" class="gx-note">Weather data by <a href="https://open-meteo.com/" target="_blank" rel="noopener noreferrer">Open-Meteo</a>. Uses your GPS area when enabled; updates in the background about every 10 minutes.</p>
               <p class="gx-note">The stopped timer appears in General edit and Stopped timer. Turn off editing aids to see the screen without outlines and guides.</p>
-              <p class="gx-note">The steering wheel and driver monitoring icon can be resized in each layout.{{ profile.widgets.nav_map ? ' The map overlay has adjustable size and opacity.' : '' }} Existing display preferences and driving state still control when widgets appear.</p>
+              <p class="gx-note">The steering wheel and driver monitoring icon can be resized in each layout.{{ projection ? ' Drag the corner to resize the map, PiP views, and turn-by-turn card. The map also has adjustable opacity.' : profile.widgets.nav_map ? ' The map overlay has adjustable size and opacity.' : '' }} Existing display preferences and driving state still control when widgets appear.</p>
               <p v-if="!projection" class="gx-note">Small speed-limit signs can overlap confirmation actions. Live confirmations hide an overlapping sign until the decision ends. Select either widget in the list to edit it.</p>
               <p v-if="!projection && state.showFavoriteZones" class="gx-note">Favorite tap areas apply to enabled slots. Speed-limit controls and the steering wheel take priority when the drawer is closed.</p>
               </div></GxCollapse>
