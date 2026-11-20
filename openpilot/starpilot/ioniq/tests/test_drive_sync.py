@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from openpilot.starpilot.ioniq.drive_sync import (
   DriveSyncClient,
   SegmentTelemetryCollector,
+  _UrllibJsonSession,
   find_active_segment,
 )
 from openpilot.starpilot.ioniq.recorder import EventFlightRecorder
@@ -162,6 +165,12 @@ class TestDriveSync(unittest.TestCase):
       self.assertEqual(len(seg0_payload['events']), 2)
       self.assertEqual(seg0_payload['events'][1]['data']['enabled'], True)
       self.assertEqual(seg0_payload['ioniq_trip_summary']['avgLPer100Km'], 4.8)
+
+  def test_default_session_falls_back_to_stdlib_urllib_without_requests(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      with patch.dict(sys.modules, {'requests': None}):
+        client = DriveSyncClient(root=tmp)
+      self.assertIsInstance(client._session, _UrllibJsonSession)
 
 
 if __name__ == '__main__':

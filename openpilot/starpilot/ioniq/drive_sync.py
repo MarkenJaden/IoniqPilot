@@ -13,14 +13,45 @@ import re
 import threading
 import time
 from typing import Any
-
-import requests
+import urllib.error
+import urllib.request
 
 from openpilot.starpilot.ioniq.can_discovery import CanFuelDiscoveryRecorder
 from openpilot.starpilot.ioniq.fuel_tracker import FuelTripTracker
 from openpilot.starpilot.ioniq.recorder import EventFlightRecorder
 from openpilot.starpilot.ioniq.storage import ioniq_storage_root, read_config, read_json, write_json_atomic
 from openpilot.starpilot.ioniq.uds_dtc import read_diagnostics_state
+
+_json_dumps = json.dumps
+
+
+class _UrllibResponse:
+  def __init__(self, status_code: int) -> None:
+    self.status_code = status_code
+
+
+class _UrllibJsonSession:
+  """Minimal stdlib JSON HTTP client fallback when requests is unavailable."""
+
+  def post(self, url: str, json: Any = None, headers: dict[str, str] | None = None, timeout: float = 10.0) -> _UrllibResponse:
+    body = _json_dumps(json, ensure_ascii=False).encode('utf-8') if json is not None else b'{}'
+    req_headers = {'Content-Type': 'application/json'}
+    if headers:
+      req_headers.update(headers)
+    req = urllib.request.Request(url, data=body, headers=req_headers, method='POST')
+    try:
+      with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return _UrllibResponse(int(getattr(resp, 'status', 200)))
+    except urllib.error.HTTPError as err:
+      return _UrllibResponse(int(err.code))
+
+
+def _default_session() -> Any:
+  try:
+    import requests
+    return requests.Session()
+  except ImportError:
+    return _UrllibJsonSession()
 
 DRIVE_PROVIDER_NAMES = ('drive', 'custom')
 MAX_QUEUE_ITEMS = 200
@@ -312,7 +343,7 @@ class DriveSyncClient:
     self,
     *,
     root: Path | str | None = None,
-    session: requests.Session | None = None,
+    session: Any | None = None,
     provider_getter: Callable[[], Any] = _default_provider,
     dongle_id_getter: Callable[[], str | None] = _default_dongle_id,
     token_provider: Callable[[str], str] = _default_token,
@@ -320,7 +351,7 @@ class DriveSyncClient:
     build_metadata_getter: Callable[[], dict[str, str]] = _default_build_metadata,
   ) -> None:
     self.root = ioniq_storage_root(root)
-    self._session = session or requests.Session()
+    self._session = session if session is not None else _default_session()
     self._provider_getter = provider_getter
     self._dongle_id_getter = dongle_id_getter
     self._token_provider = token_provider
