@@ -13,6 +13,7 @@ CONFIRMATION_NS = 30_000_000_000
 class ObservationKind(Enum):
   VALID = "valid"
   ABSENT = "absent"
+  UNLIMITED = "unlimited"
   UNKNOWN = "unknown"
   STALE = "stale"
 
@@ -437,6 +438,10 @@ def step(state: State, observation: Observation, authority: Authority, policy: P
       return finish('timeout_reject', target=previous_target())
     return finish(basis, target=previous_target())
 
+  if observation.kind is ObservationKind.UNLIMITED:
+    state = replace(state, accepted=None, rejected=None, received_speed_mps=None,
+                    pending=None, timer_running=False, presentation=None)
+    return finish("unlimited")
   if policy.display_only:
     state = replace(state, pending=None, timer_running=False)
     return finish("display_only")

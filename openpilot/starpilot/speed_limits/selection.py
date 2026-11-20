@@ -97,7 +97,8 @@ def select_limit(observations: Mapping[Source, Observation], policy: SelectionPo
   else:
     kinds = {kind for _, kind in unavailable}
     # Preserve availability; a remembered limit cannot make a missing source current.
-    kind = (ObservationKind.UNKNOWN if ObservationKind.UNKNOWN in kinds else
+    kind = (ObservationKind.UNLIMITED if ObservationKind.UNLIMITED in kinds else
+            ObservationKind.UNKNOWN if ObservationKind.UNKNOWN in kinds else
             ObservationKind.STALE if ObservationKind.STALE in kinds else ObservationKind.ABSENT)
     observation = Observation(kind)
   return Selection(observation, selected, reason, considered, tuple(unavailable), tuple(below_minimum))

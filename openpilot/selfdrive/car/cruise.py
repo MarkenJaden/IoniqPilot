@@ -82,7 +82,8 @@ class VCruiseHelper:
     return self.v_cruise_kph != V_CRUISE_UNSET
 
   def update_v_cruise(self, CS, enabled, is_metric, slc_pending: SlcPendingConfirmation | None = None, *,
-                      slc_enabled: bool = False, wheel_context: SlcWheelContext | None = None):
+                      slc_enabled: bool = False, wheel_context: SlcWheelContext | None = None,
+                      slc_step_handler=None):
     from opendbc.car.subaru.software_cruise import selected as subaru_software_selected
     subaru_software = subaru_software_selected(self.CP)
     software_cruise = not self.CP.pcmCruise or subaru_software
@@ -120,7 +121,7 @@ class VCruiseHelper:
         if subaru_software and (not enabled or not self.v_cruise_initialized):
           stock_kph = CS.cruiseState.speed * CV.MS_TO_KPH
           self.v_cruise_kph = stock_kph if 0 < stock_kph < V_CRUISE_UNSET else V_CRUISE_UNSET
-        self._update_v_cruise_non_pcm(CS, enabled, is_metric)
+        self._update_v_cruise_non_pcm(CS, enabled, is_metric, slc_step_handler=slc_step_handler)
         self.v_cruise_cluster_kph = self.v_cruise_kph
         self.update_button_timers(CS, enabled)
       else:
@@ -194,7 +195,7 @@ class VCruiseHelper:
         self.slc_suppressed_buttons.add(button)
         self.slc_consumed_button = SlcConsumedButton(slc_pending, 'accel' if button == ButtonType.accelCruise else 'decel')
 
-  def _update_v_cruise_non_pcm(self, CS, enabled, is_metric):
+  def _update_v_cruise_non_pcm(self, CS, enabled, is_metric, *, slc_step_handler=None):
     # handle button presses. TODO: this should be in state_control, but a decelCruise press
     # would have the effect of both enabling and changing speed is checked after the state transition
     if not enabled:
@@ -231,6 +232,9 @@ class VCruiseHelper:
 
     # Don't adjust speed if we've enabled since the button was depressed (some ports enable on rising edge)
     if not self.button_change_states[button_type]["enabled"]:
+      return
+
+    if slc_step_handler is not None and slc_step_handler(button_type, CS, is_metric, long_press):
       return
 
     changed = self.adjust_v_cruise(button_type, CS, is_metric, long_press=long_press)
@@ -284,6 +288,17 @@ class VCruiseHelper:
         self.button_timers[b.type.raw] = 1 if b.pressed else 0
         self.button_change_states[b.type.raw] = {"standstill": CS.cruiseState.standstill, "enabled": enabled}
 
+  def step_speed_kph(self, base_kph: float, button_type, is_metric: bool, *, long_press: bool = False) -> float:
+    v_cruise_delta = 1. if is_metric else IMPERIAL_INCREMENT
+    interval = self.intervals.held if long_press else self.intervals.short
+    v_cruise_delta = v_cruise_delta * interval
+    display_speed = round(base_kph if is_metric else base_kph * CV.KPH_TO_MPH)
+    if interval % 5 == 0 and display_speed % interval != 0:
+      next_kph = CRUISE_NEAREST_FUNC[button_type](display_speed / interval) * interval * (1. if is_metric else CV.MPH_TO_KPH)
+    else:
+      next_kph = base_kph + v_cruise_delta * CRUISE_INTERVAL_SIGN[button_type]
+    return float(np.clip(round(next_kph, 1), V_CRUISE_MIN, V_CRUISE_MAX))
+
   def apply_slc_target(self, target_mps: float, is_metric: bool) -> None:
     """Set the software cruise ceiling for engagement or a qualified driver request."""
     # Match ordinary button precision so stepping away and back restores this target.
@@ -291,11 +306,17 @@ class VCruiseHelper:
     self.v_cruise_cluster_kph = self.v_cruise_kph
 
   def initialize_v_cruise(self, CS, experimental_mode: bool, *, resume: bool | None = None,
-                          initial_speed: object = V_CRUISE_INITIAL, slc_target_mps: float | None = None, is_metric: bool = False) -> bool:
+                          initial_speed: object = V_CRUISE_INITIAL, slc_target_mps: float | None = None,
+                          is_metric: bool = False, engage_set_mode: str = 'current',
+                          engage_resume_mode: str = 'last_set_or_current',
+                          slc_limit_mps: float | None = None) -> bool:
     """Return whether engagement used the supplied SLC target."""
     if (not self.CP.openpilotLongitudinalControl or slc_target_mps is None or type(slc_target_mps) not in (int, float) or
         not math.isfinite(slc_target_mps) or not V_CRUISE_MIN / 3.6 - 1e-5 <= slc_target_mps <= V_CRUISE_MAX / 3.6 + 1e-5):
       slc_target_mps = None
+    if (not self.CP.openpilotLongitudinalControl or slc_limit_mps is None or type(slc_limit_mps) not in (int, float) or
+        not math.isfinite(slc_limit_mps) or not V_CRUISE_MIN / 3.6 - 1e-5 <= slc_limit_mps <= V_CRUISE_MAX / 3.6 + 1e-5):
+      slc_limit_mps = None
     # Native cruise owns PCM SET, including when SLC supplies a planner cap.
     if self.CP.pcmCruise:
       return False
@@ -305,15 +326,21 @@ class VCruiseHelper:
       resume = (0 < self.pending_resume_ns and 0 <= age <= 500_000_000) or any(
         b.type in (ButtonType.accelCruise, ButtonType.resumeCruise) for b in CS.buttonEvents)
     self.pending_resume_ns = 0
-    if resume and self.v_cruise_initialized:
-      self.v_cruise_kph = self.v_cruise_kph_last
+    if resume:
+      if engage_resume_mode != 'current' and self.v_cruise_initialized:
+        self.v_cruise_kph = self.v_cruise_kph_last
+        self.v_cruise_cluster_kph = self.v_cruise_kph
+        return False
+      self.v_cruise_kph = int(round(np.clip(max(CS.vEgo * CV.MS_TO_KPH, validated_initial_cruise_speed(initial_speed)), V_CRUISE_INITIAL, V_CRUISE_MAX)))
       self.v_cruise_cluster_kph = self.v_cruise_kph
       return False
-    elif slc_target_mps is not None:
+    if slc_target_mps is not None:
       self.apply_slc_target(slc_target_mps, is_metric)
       return True
-    else:
-      self.v_cruise_kph = int(round(np.clip(max(CS.vEgo * CV.MS_TO_KPH, validated_initial_cruise_speed(initial_speed)), V_CRUISE_INITIAL, V_CRUISE_MAX)))
+    if engage_set_mode == 'limit' and slc_limit_mps is not None:
+      self.apply_slc_target(slc_limit_mps, is_metric)
+      return True
+    self.v_cruise_kph = int(round(np.clip(max(CS.vEgo * CV.MS_TO_KPH, validated_initial_cruise_speed(initial_speed)), V_CRUISE_INITIAL, V_CRUISE_MAX)))
 
     self.v_cruise_cluster_kph = self.v_cruise_kph
     return False

@@ -49,7 +49,9 @@ from openpilot.starpilot.lateral.torque_settings import DOCUMENT_KEY, LEGACY_KEY
 from openpilot.starpilot.ui.torque_feature import TorqueFeature
 from openpilot.starpilot.ui.controller_feature import ControllerFeature, SETUP_ACTION
 from openpilot.starpilot.ui.slc_offset_feature import SlcOffsetOwner
-from openpilot.starpilot.ui.slc_policy_feature import SLC_ADVANCE_CHOICES, policy_rows
+from openpilot.starpilot.ui.slc_policy_feature import (
+  SLC_ADVANCE_CHOICES, SLC_PREF_PREFIX, apply_preference_request, policy_rows, preference_rows,
+)
 from openpilot.starpilot.longitudinal.profile_preferences import read_document_value, read_profile_health
 from openpilot.starpilot.ui.long_profile_feature import (LongProfileFeature, is_long_confirm_action, VALUE_HELP, CATEGORY_HELP,
                                                        preset_label, preset_value)
@@ -1199,6 +1201,7 @@ class FeatureSettingsOwner:
       rows.append(self._bool_row("UseVienna", "Vienna Signs", self.authority("preferences"),
                                  reason="Draw speed-limit signs in the round European Vienna style instead of the rectangular US style"))
       rows.extend(policy_rows(self._value, self._readable, allowed=allowed))
+      rows.extend(preference_rows(allowed=allowed, preferences_allowed=configurable and self.authority("preferences")))
       if cp is not None and not cp.pcmCruise:
         rows.append(self._bool_row(WHEEL_OVERRIDE_KEY, "Override speed limit with +", allowed and control == "1",
                                    reason="Press + to raise SET past the adjusted limit and use your new SET speed."))
@@ -1585,6 +1588,18 @@ class FeatureSettingsOwner:
         group = "lane_live"
       else:
         group = "lane" if key.startswith("LaneCenter") else "long" if long_key else "slc"
+    elif key.startswith(SLC_PREF_PREFIX):
+      group = "preferences" if key in (
+        f"{SLC_PREF_PREFIX}unlimited_recognition",
+        f"{SLC_PREF_PREFIX}unlimited_display",
+        f"{SLC_PREF_PREFIX}stvo_fallback",
+      ) else "slc"
+      if not request.vehicle_fingerprint or self.vehicle_fingerprint() != request.vehicle_fingerprint or not self.authority(group):
+        return False
+      if not apply_preference_request(key, request.value):
+        return False
+      self.publish()
+      return True
     else:
       return False
     try:

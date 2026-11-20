@@ -113,7 +113,7 @@ class Controls:
     ] + (['aolAxisState', 'aolSafetyWire'] if self.aol_replay or self.ordinary_axis_ack_required else [])
     optional = list(
       dict.fromkeys(
-        self.longitudinal_inputs.optional_services + ['starpilotCarState', 'deviceState', 'autoSteeringLearning', 'starpilotSteeringTracking', 'pandaStates']
+        self.longitudinal_inputs.optional_services + ['starpilotCarState', 'deviceState', 'autoSteeringLearning', 'starpilotSteeringTracking', 'pandaStates', 'slcState']
       )
     )
     if optional:
@@ -763,7 +763,17 @@ class Controls:
       )
 
     hudControl = CC.hudControl
-    hudControl.setSpeed = float(CS.vCruiseCluster * CV.KPH_TO_MS)
+    cluster_set_mps = float(CS.vCruiseCluster * CV.KPH_TO_MS)
+    if (CC.enabled and not self.CP.pcmCruise and self.sm.valid.get('slcState', False) and self.sm.alive.get('slcState', False)):
+      from openpilot.starpilot.speed_limits.preferences import load_preferences_cached
+      if load_preferences_cached().cluster_effective_speed:
+        slc_state = self.sm['slcState']
+        if (slc_state.enabled and not slc_state.displayOnly and str(slc_state.observationKind) != 'unlimited' and
+            slc_state.hasEffectiveClusterTarget and (slc_state.isLimitingMaxSet or slc_state.driverOverrideActive)):
+          eff_mps = float(slc_state.effectiveClusterTarget)
+          if math.isfinite(eff_mps) and eff_mps > 0:
+            cluster_set_mps = min(eff_mps, cluster_set_mps)
+    hudControl.setSpeed = cluster_set_mps
     hudControl.speedVisible = CC.enabled
     hudControl.lanesVisible = CC.enabled
     hudControl.leadVisible = self.sm['longitudinalPlan'].hasLead

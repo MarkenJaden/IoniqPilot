@@ -30,6 +30,14 @@
    - `vienna-speed-limit`: Vienna convention speed-limit sign styling & UI toggle (`PR branch` on `StarPilotHQ/StarPilot`).
    - `custom-cloud-provider`: Custom connect/cloud endpoint support alongside comma/konik (`PR branch` on `StarPilotHQ/StarPilot`).
 
+4. **German Speed Limit Controller (SLC) Overhaul & EU Vision Training Scaffold**
+   - `openpilot/starpilot/speed_limits/preferences.py`: Atomic JSON persistence under `starpilot_storage_root() / 'slc' / 'preferences.json'` (with mtime-cached `load_preferences_cached()`), avoiding any new keys in `openpilot/common/params_keys.h`.
+   - German **Unbegrenzt (Zeichen 282)** & optional **StVO fallback** (`50` urban / `100` rural / unlimited dual-carriageway trunk) across `acceptance.py` (`ObservationKind.UNLIMITED`), `selection.py`, `map_source.py`, `map_observation.py`, `runtime.py`, `opendbc_repo/opendbc/car/dashboard_speed_limit.py` (`hyundai_canfd_sign` 253), `onroad_state.py` (`speed_limit_bounds` fix), `unified_speed_presentation.py`, and `speed_limit_widget.py` (Vienna Zeichen 282 5-stripe icon or hide option).
+   - **Smart `+`/`−` step override** from the active SLC limit (`speed_domain.py`, `composition.py`, `runtime.py`, `planner_host.py`, `cruise.py`, `card.py` via `SlcCruiseEvent.kind == 'commandApplied'`), auto-clearing on the next limit change or `Cancel` (`Cancel` + `SET` re-adopts the active limit; `RES` restores last `SET` or current speed).
+   - **Ioniq Instrument Cluster (`SCC11.VSetDis`) Effective Speed** (`openpilot/selfdrive/controls/controlsd.py`): Displays active SLC-capped or step-overridden target on the car dashboard while preserving the driver's max `SET` speed.
+   - **Dynamic Braking-Curve Early Adoption** (`openpilot/starpilot/speed_limits/advance.py`, `runtime_settings.py` up to 25 s / 500 m) and 10 UI/Galaxy settings (`slc_policy_feature.py`, `feature_settings_owner.py`, `setting_descriptions.py`).
+   - `openpilot/starpilot/speed_limits/vision/eu_training/` (`README.md`, `classes.py`, `prepare_dataset.py`, `train_export_onnx.py`) and `openpilot/starpilot/speed_limits/tests/test_slc_overhaul.py`.
+
 ## Merge Conflict Policy
 
 - Preserve all files in `openpilot/starpilot/ioniq/`, `openpilot/starpilot/galaxy/ioniq_tools.py`, `openpilot/starpilot/galaxy/web/js/ioniq-tools.js`, `openpilot/starpilot/galaxy/tests/test_ioniq_tools.mjs`, `opendbc_repo/opendbc/car/hyundai/tests/test_classic_auto_main.py`, `.github/workflows/upstream-sync.yml`, and `FORK_DIVERGENCES.md`.

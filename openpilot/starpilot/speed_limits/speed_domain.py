@@ -218,11 +218,12 @@ def resolve(decision: acc.Decision, schedule: OffsetSchedule, selected: SpeedPai
     ego.raw_mps, ego_delta))
 
 
-def to_planner_coordinate(context: DomainContext, *, override_mps: float = 0.) -> PlannerCoordinate:
+def to_planner_coordinate(context: DomainContext, *, override_mps: float = 0.,
+                          allow_below_limit: bool = False) -> PlannerCoordinate:
   """Remove the ego delta from the selected cluster target exactly once."""
   if not context_is_valid(context) or not acc.number(override_mps):
     return PlannerCoordinate(None, "invalid")
-  cluster_target = max(context.effective_cluster_mps, override_mps)
+  cluster_target = override_mps if (allow_below_limit and override_mps > 0.) else max(context.effective_cluster_mps, override_mps)
   cap = cluster_target - context.ego_delta_mps
   if not acc.number(cap, positive=True):
     return PlannerCoordinate(None, "nonpositive", cluster_target, context.ego_delta_mps)

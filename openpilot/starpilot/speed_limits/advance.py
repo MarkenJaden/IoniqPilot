@@ -23,6 +23,19 @@ class Encounter:
   retired: bool = False
 
 
+def _trigger_distance_m(speed_mps: float, target_mps: float, *, seconds: int,
+                        advance_mode: str, distance_m: int, decel_mps2: float) -> float:
+  if advance_mode == 'distance':
+    return float(max(0, min(500, distance_m)))
+  if advance_mode == 'dynamic':
+    buffer_m = speed_mps * max(0, min(25, seconds)) + max(0, min(500, distance_m))
+    if target_mps < speed_mps and decel_mps2 > 0:
+      braking_m = (speed_mps * speed_mps - target_mps * target_mps) / (2.0 * decel_mps2)
+      return min(500.0, max(0.0, braking_m + buffer_m))
+    return min(500.0, max(0.0, buffer_m))
+  return speed_mps * max(0, min(25, seconds))
+
+
 class Advance:
   def __init__(self):
     self.encounter: Encounter | None = None
@@ -49,7 +62,8 @@ class Advance:
   def propose(self, observations, policy, upcoming: Upcoming | None, *, current_way_id: int,
               higher_seconds: int, lower_seconds: int, speed_mps: float | None, standstill: bool, can_offer: bool,
               confirmation_active: bool, now_ns: int, pending: acc.PendingDecision | None, live: acc.Candidate | None,
-              current_unresolved: bool):
+              current_unresolved: bool, advance_mode: str = 'time', advance_distance_m: int = 0,
+              advance_decel_mps2: float = 1.2):
     self.boundary_id, self.started_ns = '', None
     self.retired_cap = None
     self.retired_pending_speed_mps = None
@@ -137,9 +151,14 @@ class Advance:
                        pending.candidate.source == live.source and pending.candidate.speed_mps == live.speed_mps)
     # shortcut: use fresh GPS distance without propagation; revisit only if replay shows material timing error.
     current_first = current_unresolved and (encounter is None or encounter.crossed)
-    eligible = (can_offer and not (pending_current or current_first) and type(seconds) is int and 0 < seconds <= 10 and not standstill and
-                speed_mps is not None and type(speed_mps) in (int, float) and math.isfinite(speed_mps) and speed_mps > 0 and
-                upcoming is not None and upcoming.distance_m <= speed_mps * seconds)
+    trigger_m = (0.0 if upcoming is None or speed_mps is None or type(speed_mps) not in (int, float) or
+                 not math.isfinite(speed_mps) or speed_mps <= 0 or upcoming.observation.candidate is None else
+                 _trigger_distance_m(float(speed_mps), upcoming.observation.candidate.speed_mps,
+                                     seconds=seconds if type(seconds) is int and 0 <= seconds <= 25 else 0,
+                                     advance_mode=advance_mode, distance_m=advance_distance_m,
+                                     decel_mps2=advance_decel_mps2))
+    eligible = (can_offer and not (pending_current or current_first) and not standstill and
+                trigger_m > 0.0 and upcoming is not None and upcoming.distance_m <= trigger_m)
     if eligible:
       if encounter is None or replaced and not (encounter.crossed and pending_preview):
         proposed = dict(observations)

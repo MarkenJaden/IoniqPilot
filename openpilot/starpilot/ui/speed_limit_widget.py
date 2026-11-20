@@ -303,6 +303,38 @@ class SpeedLimitWidget:
     header_y = 47 - lift if vienna else 21 if offset_text or large else 26
     number_center = (73 if offset_text else 80) - lift if vienna else 76 if offset_text or large else 90
     # The outline alone marks the limit being followed; it is drawn thicker so it reads at a glance.
+    if shown.unlimited and not shown.pending:
+      if vienna:
+        if large:
+          scale, text_scale = scale * VIENNA_SCALE, text_scale * VIENNA_SCALE
+          x = bounds[0] + 12 + SIGN_WIDTH / 2 * self.scale - 59 * scale
+          top = card_top + SHARED_NUMBER_ROW * self.scale - number_center * scale
+        else:
+          x, top = x + 5 * scale, top + 5 * scale
+        vx, vy = x + 59 * scale, top + vienna_center_y * scale
+        ring_color = self.pulse.color(rl.Color(225, 232, 229, 255), now)
+        stripe_color = self.pulse.color(rl.Color(215, 224, 220, 230), now)
+        self.shapes.circle(vx, vy, ring_color, scale=scale)
+        # German Zeichen 282: 5 parallel diagonal stripes across the white/light circle.
+        for offset_px in (-16, -8, 0, 8, 16):
+          half = math.sqrt(max(0.0, 40.0 ** 2 - offset_px ** 2)) * 0.85
+          dx = half * 0.7071
+          dy = half * 0.7071
+          ox = -offset_px * 0.7071
+          oy = offset_px * 0.7071
+          p1 = rl.Vector2(vx + (ox - dx) * scale, vy + (oy + dy) * scale)
+          p2 = rl.Vector2(vx + (ox + dx) * scale, vy + (oy - dy) * scale)
+          draw_line(self.profile, p1, p2, 2.6 * scale, stripe_color)
+      else:
+        sign_scale = 150 / SIGN_HEIGHT
+        outline_row = SIGN_HEIGHT * sign_scale / 2 - 9
+        if large:
+          top = card_top + (SHARED_NUMBER_ROW - number_center) * scale
+          outline_row = 54.5
+        self.shapes.outline(x + center_x * scale, top + outline_row * scale, white,
+                            scale=scale * sign_scale, width_scale=SIGN_HEIGHT * 4 / 5 / SIGN_WIDTH)
+        centered('UNLIM', FontRole.SEMI_BOLD, 28, number_center - 14, white)
+      return
     if vienna:
       if large:
         # A larger ring in the US sign's column, placed so its number sits on the shared row.

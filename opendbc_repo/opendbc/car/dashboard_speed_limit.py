@@ -9,6 +9,7 @@ class Status(str, Enum):
   UNKNOWN = "unknown"
   VALID = "valid"
   ABSENT = "absent"
+  UNLIMITED = "unlimited"
 
 
 @dataclass(frozen=True)
@@ -86,4 +87,6 @@ def hyundai_canfd_sign(speed: int, system_status: int, is_metric: bool) -> tuple
     return Status.UNKNOWN, 0.0
   if 1 <= speed <= 252:
     return Status.VALID, speed * (1 / 3.6 if is_metric else 0.44704)
-  return (Status.ABSENT, 0.0) if speed in (0, 253) else (Status.UNKNOWN, 0.0)
+  if speed == 253:
+    return Status.UNLIMITED, 0.0
+  return (Status.ABSENT, 0.0) if speed == 0 else (Status.UNKNOWN, 0.0)

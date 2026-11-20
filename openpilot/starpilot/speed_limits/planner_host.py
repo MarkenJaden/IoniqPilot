@@ -15,7 +15,7 @@ from openpilot.starpilot.speed_limits.runtime_settings import read_params as rea
 
 ACTION_MAX_AGE_NS = int(2e9 / SERVICE_LIST['modelV2'].frequency)
 SLC_ACTIONS = ('accept', 'reject', 'adopt')
-SLC_CRUISE_EVENTS = ('driverChange', 'confirmationAccept', 'confirmationReject', 'engagementAdopt')
+SLC_CRUISE_EVENTS = ('driverChange', 'confirmationAccept', 'confirmationReject', 'engagementAdopt', 'commandApplied')
 
 
 class SavedSlcLifecycle:
@@ -71,6 +71,8 @@ class SavedSlcLifecycle:
         self.runtime.update_advance(settings.advance_higher_seconds, settings.advance_lower_seconds)
       if settings.wheel_override != self.runtime.settings.wheel_override:
         self.runtime.state = replace(self.runtime.state, wheel_override_metric=None, wheel_override_since_ns=0)
+      if not settings.preferences.step_override_enabled and self.runtime.state.step_override_mps > 0.:
+        self.runtime.state = replace(self.runtime.state, step_override_mps=0.)
       self.runtime.settings = settings
       self.runtime.vision_enabled = vision
       self.runtime.vision_control_qualified = vision and configuration[3]

@@ -31,6 +31,7 @@ from openpilot.starpilot.speed_limits.speed_domain import OffsetSchedule
 class ObservationKind(StrEnum):
   VALID = "valid"
   ABSENT = "absent"
+  UNLIMITED = "unlimited"
   UNKNOWN = "unknown"
   STALE = "stale"
 
@@ -336,8 +337,8 @@ SIGN_PADDING = {Profile.LARGE: (19, 26), Profile.COMPACT: (12, 8)}
 
 
 def speed_limit_bounds(profile: Profile, state: OnroadState) -> tuple[float, float, float, float] | None:
-  from openpilot.starpilot.ui.unified_speed_presentation import displayed_limit_mps
-  if (displayed_limit_mps(state.speed_limit) is None or
+  from openpilot.starpilot.ui.unified_speed_presentation import displayed_limit_mps, show_unlimited_sign
+  if ((displayed_limit_mps(state.speed_limit) is None and not show_unlimited_sign(state.speed_limit)) or
       not state.appearance.show_speed_limit_sign and not state.speed_limit.action_enabled):
     return None
   widget = 'speed_limit' if profile == Profile.COMPACT else 'cruise_limits'

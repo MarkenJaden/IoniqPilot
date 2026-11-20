@@ -45,7 +45,8 @@ class MapSource:
     self.way_id = 0
 
   def step(self, frame: ms.MapFrame | None, *, received: bool, now_boot_ns: int,
-           transport_alive: bool, drive_session: str, car_fingerprint: str) -> acc.Observation:
+           transport_alive: bool, drive_session: str, car_fingerprint: str,
+           unlimited_recognition: str = 'off', stvo_fallback: bool = False) -> acc.Observation:
     self.upcoming = None
     self.way_id = 0
     evidence = self.tracker.step(frame, received=received, now_boot_ns=now_boot_ns,
@@ -62,6 +63,23 @@ class MapSource:
       return acc.Observation(acc.ObservationKind.UNKNOWN)
     self.way_id = accepted.way_id
     if evidence.kind == 'matched_no_limit_unqualified':
+      hw = getattr(accepted, 'highway_class', '')
+      ctx = getattr(accepted, 'road_context', '')
+      one_way = bool(getattr(accepted, 'one_way', False))
+      if unlimited_recognition != 'off':
+        if hw == 'motorway' or (stvo_fallback and hw == 'trunk' and (one_way or ctx == 'highway')):
+          return acc.Observation(acc.ObservationKind.UNLIMITED)
+      if stvo_fallback:
+        fallback_kph = 0
+        if hw == 'residential' or (ctx == 'urban' and hw in ('trunk', 'primary', 'secondary', 'tertiary', 'unclassified')):
+          fallback_kph = 50
+        elif hw in ('trunk', 'primary', 'secondary', 'tertiary', 'unclassified'):
+          fallback_kph = 100
+        if fallback_kph > 0:
+          identity = hashlib.sha256(json.dumps((drive_session, car_fingerprint, accepted.producer_session,
+            accepted.generation, accepted.source, accepted.way_id, 'stvo', fallback_kph), separators=(',', ':')).encode()).hexdigest()
+          return acc.Observation(acc.ObservationKind.VALID, acc.Candidate('map',
+            acc.ObservationIdentity(acc.IdentityKind.GEOGRAPHIC, value=identity), acc.float32(fallback_kph / 3.6)))
       return evidence.observation
     identity = hashlib.sha256(json.dumps((drive_session, car_fingerprint, accepted.producer_session,
       accepted.generation, accepted.source, accepted.way_id), separators=(',', ':')).encode()).hexdigest()

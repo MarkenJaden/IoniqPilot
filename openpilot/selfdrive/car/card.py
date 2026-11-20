@@ -35,6 +35,7 @@ from opendbc.car.interfaces import CarInterfaceBase, RadarInterfaceBase
 from openpilot.selfdrive.pandad import can_capnp_to_list, can_list_to_can_capnp
 from openpilot.selfdrive.car.cruise import SlcWheelContext, VCruiseHelper, slc_target_kph
 from openpilot.starpilot.speed_limits import physical_actions as slc_physical
+from openpilot.starpilot.speed_limits.preferences import SlcPreferences, load_preferences
 from openpilot.starpilot.aol.intent import AolProcessFaultContext, independent_axis_requested, read_settings
 from openpilot.starpilot.aol.transport_pause import TransportPauseFeedback, cp_identity
 from opendbc.car.honda.stock_aol import (
@@ -457,6 +458,9 @@ class Car:
     self.slc_replay = self.slc_configuration[0]
     self.slc_control_enabled = self.slc_replay and self.slc_configuration[1].enabled
     self.slc_match_on_engage = self.slc_transport_available and self.read_slc_match_on_engage()
+    self.slc_preferences = load_preferences()
+    self._slc_step_override_kph: float | None = None
+    self._slc_step_override_limit_kph: float | None = None
     self.slc_source_floor_ns = 0
 
     if not self.ioniq6_previous_cp_saved:
@@ -870,12 +874,57 @@ class Car:
       helper.apply_slc_target(target, self.is_metric)
 
   def update_cruise_speed(self, CS, pending=None, *, wheel_context: SlcWheelContext | None = None):
+    now_ns = int(self.can_log_mono_time) if REPLAY and hasattr(self, 'can_log_mono_time') else time.monotonic_ns()
+    prefs = getattr(self, 'slc_preferences', SlcPreferences())
+    slc_valid = (getattr(self, 'slc_control_enabled', False) and self.sm.valid.get('slcState', False) and
+                 self.sm.alive.get('slcState', False))
+    slc_state = self.sm['slcState'] if slc_valid else None
+    current_limit_kph = (slc_target_kph(float(slc_state.acceptedAdjustedLimit), self.is_metric)
+                         if slc_state is not None and str(slc_state.observationKind) != 'unlimited' and
+                         slc_state.hasAcceptedAdjustedLimit and float(slc_state.acceptedAdjustedLimit) > 0
+                         else None)
+    if (not self.sm['carControl'].enabled or current_limit_kph is None or
+        (getattr(self, '_slc_step_override_limit_kph', None) is not None and
+         round(current_limit_kph) != round(self._slc_step_override_limit_kph))):
+      self._slc_step_override_kph = None
+      self._slc_step_override_limit_kph = current_limit_kph
+
+    def handle_slc_step(button_type, cs_frame, is_metric, long_press) -> bool:
+      if (not prefs.step_override_enabled or not getattr(self, 'slc_control_enabled', False) or
+          self.CP.pcmCruise or not self.CP.openpilotLongitudinalControl or pending is not None or
+          slc_state is None or current_limit_kph is None or not str(slc_state.sessionId)):
+        return False
+      button_name = 'accel' if button_type == structs.CarState.ButtonEvent.Type.accelCruise else (
+                    'decel' if button_type == structs.CarState.ButtonEvent.Type.decelCruise else '')
+      if not button_name or (button_name == 'accel' and cs_frame.cruiseState.standstill):
+        return False
+      step_current = getattr(self, '_slc_step_override_kph', None)
+      if step_current is None and current_limit_kph >= self.v_cruise_helper.v_cruise_kph - 0.5:
+        return False
+      base_kph = step_current if step_current is not None else current_limit_kph
+      next_kph = self.v_cruise_helper.step_speed_kph(base_kph, button_type, is_metric, long_press=long_press)
+      if min(base_kph, next_kph) < current_limit_kph < max(base_kph, next_kph):
+        next_kph = current_limit_kph
+      detail = (str(slc_state.sessionId), button_name, bool(long_press))
+      if abs(next_kph - current_limit_kph) < 0.25:
+        self._slc_step_override_kph = None
+        self._slc_step_override_limit_kph = current_limit_kph
+        self.slc_receipts.append(('commandApplied', detail, float(base_kph / 3.6), 0.0, now_ns))
+        return True
+      if next_kph > self.v_cruise_helper.v_cruise_kph:
+        self.v_cruise_helper.v_cruise_kph = next_kph
+        self.v_cruise_helper.v_cruise_cluster_kph = next_kph
+      self._slc_step_override_kph = next_kph
+      self._slc_step_override_limit_kph = current_limit_kph
+      self.slc_receipts.append(('commandApplied', detail, float(base_kph / 3.6), float(next_kph / 3.6), now_ns))
+      return True
+
     self.v_cruise_helper.update_v_cruise(CS, self.sm['carControl'].enabled, self.is_metric, pending,
                                        slc_enabled=getattr(self, 'slc_control_enabled', getattr(self, 'slc_replay', False)),
-                                       wheel_context=wheel_context)
+                                       wheel_context=wheel_context, slc_step_handler=handle_slc_step)
     if self.sm['carControl'].enabled and not self.CC_prev.enabled:
       target, initial = None, None
-      now_ns = int(self.can_log_mono_time) if REPLAY and hasattr(self, 'can_log_mono_time') else time.monotonic_ns()
+      self._slc_step_override_kph = None
       if (getattr(self, 'slc_match_on_engage', False) and getattr(self, 'slc_control_enabled', False) and
           not self.CP.pcmCruise and self.CP.openpilotLongitudinalControl and
           CS.canValid and not CS.canTimeout and CS.cruiseState.available and
@@ -892,9 +941,17 @@ class Car:
           target, initial = slc_physical.engagement_target(
             self.sm, evidence.observation if evidence is not None else None, self.slc_producer_session,
             now_ns, after_ns=getattr(self, 'slc_source_floor_ns', 0))
+      slc_limit_mps = None
+      if slc_state is not None and str(slc_state.observationKind) != 'unlimited':
+        if slc_state.hasAcceptedAdjustedLimit:
+          slc_limit_mps = float(slc_state.acceptedAdjustedLimit)
+        elif slc_state.hasPresentationAdjustedLimit:
+          slc_limit_mps = float(slc_state.presentationAdjustedLimit)
       adopted = self.v_cruise_helper.initialize_v_cruise(
         self.CS_prev, self.experimental_mode, resume=self.vehicle_startup.consume_cruise_resume(), initial_speed=self.initial_cruise_speed,
-        slc_target_mps=target, is_metric=self.is_metric)
+        slc_target_mps=target, is_metric=self.is_metric,
+        engage_set_mode=prefs.engage_set_mode, engage_resume_mode=prefs.engage_resume_mode,
+        slc_limit_mps=slc_limit_mps)
       if adopted and initial is not None:
         self.slc_receipts.append(('engagementAdopt', initial, 0.0, float(self.v_cruise_helper.v_cruise_kph / 3.6), now_ns))
 
@@ -1256,6 +1313,10 @@ class Car:
           record.decisionId = int(detail.decisionId)
           record.presentationId = int(detail.presentationId)
           record.button = 'decel'
+        elif kind == 'commandApplied':
+          record.sessionId = str(detail[0])
+          record.button = str(detail[1])
+          record.longPress = bool(detail[2])
         self.pm.send('slcCruiseEvent', event)
 
     if getattr(self, 'conditional_replay', False) and self.manual_receipt is not None:
@@ -2007,6 +2068,7 @@ class Car:
         self.slc_requested_configuration = self.read_slc_configuration()
         if getattr(self, 'slc_transport_available', False):
           self.slc_match_on_engage = self.read_slc_match_on_engage()
+        self.slc_preferences = load_preferences()
         self.v_cruise_helper.intervals = read_cruise_intervals(self.params, self.CP)
         for name in ('bluepilot_inputs', 'hands_free_cluster_input'):
           source = getattr(self.CI.CC, name, None)

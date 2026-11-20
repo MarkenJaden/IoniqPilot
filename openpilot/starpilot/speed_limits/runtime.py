@@ -38,7 +38,8 @@ def _paired_card_frame(sm, source_log_ns: int, now_ns: int, *, max_skew_service:
           car_log_ns - source_log_ns <= max_skew_ns)
 
 
-def dashboard_observation(evidence, *, car_fingerprint: str, session_id: str, now_ns: int) -> acc.Observation:
+def dashboard_observation(evidence, *, car_fingerprint: str, session_id: str, now_ns: int,
+                          unlimited_enabled: bool = True) -> acc.Observation:
   """Project an OEM TSR observation; schema default zero is never absence."""
   status = str(evidence.status)
   timestamp, expiry = int(evidence.observedMonoTime), int(evidence.validUntilMonoTime)
@@ -48,6 +49,8 @@ def dashboard_observation(evidence, *, car_fingerprint: str, session_id: str, no
     return acc.Observation(acc.ObservationKind.STALE)
   if status == "stale":
     return acc.Observation(acc.ObservationKind.STALE)
+  if status == "unlimited":
+    return acc.Observation(acc.ObservationKind.UNLIMITED if unlimited_enabled else acc.ObservationKind.ABSENT)
   if status == "absent":
     return acc.Observation(acc.ObservationKind.ABSENT)
   if status != "valid" or not acc.number(evidence.speedMps, positive=True) or int(evidence.episode) <= 0:
@@ -253,6 +256,17 @@ class Runtime:
     kind = acc.ActionKind.ACCEPT if event.kind == 'confirmationAccept' else acc.ActionKind.REJECT
     return acc.DriverAction(self.session_id, action_id, pending.decision_id, kind, event.observed_ns), None, action_id
 
+  def _step_override_event(self, event: CruiseEvent | None, sm, now_ns: int) -> float | None:
+    if (event is None or event.kind != 'commandApplied' or not self._event_current(event, sm, now_ns) or
+        event.session_id != self.session_id or event.button not in ('accel', 'decel') or
+        not _fresh(sm, 'slcDashboardObservation', now_ns) or
+        event.producer_session != str(sm['slcDashboardObservation'].producerSessionId) or
+        not acc.number(event.selected_mps) or
+        (event.selected_mps != 0.0 and not (V_CRUISE_MIN / 3.6 - 1e-5 <= event.selected_mps <= V_CRUISE_MAX / 3.6 + 1e-5))):
+      return None
+    self._mark_event(event)
+    return float(event.selected_mps)
+
   @property
   def _maps_selected(self) -> bool:
     policy = self.settings.selection
@@ -268,7 +282,8 @@ class Runtime:
       if (int(sm.logMonoTime['slcDashboardObservation']) == source_log_ns and
           _paired_card_frame(sm, source_log_ns, now_ns, max_skew_service='carState')):
         values[sel.Source.DASHBOARD] = dashboard_observation(
-          evidence, car_fingerprint=str(CP.carFingerprint), session_id=self.session_id, now_ns=now_ns)
+          evidence, car_fingerprint=str(CP.carFingerprint), session_id=self.session_id, now_ns=now_ns,
+          unlimited_enabled=self.settings.preferences.unlimited_recognition == 'combined')
     elif sm.logMonoTime.get("carState", 0) or sm.logMonoTime.get('slcDashboardObservation', 0):
       values[sel.Source.DASHBOARD] = acc.Observation(acc.ObservationKind.STALE)
     if self.vision_enabled and _fresh(sm, 'slcVisionObservation', now_ns):
@@ -310,7 +325,9 @@ class Runtime:
           frame = None  # malformed current message revokes held map evidence
         values[sel.Source.MAP] = self.map_source.step(frame, received=received,
           now_boot_ns=pair[1], transport_alive=bool(sm.alive.get('mapdOut', False)),
-          drive_session=self.session_id, car_fingerprint=str(CP.carFingerprint))
+          drive_session=self.session_id, car_fingerprint=str(CP.carFingerprint),
+          unlimited_recognition=self.settings.preferences.unlimited_recognition,
+          stvo_fallback=self.settings.preferences.stvo_fallback)
       else:
         self.map_source.reset()
         values[sel.Source.MAP] = acc.Observation(acc.ObservationKind.STALE)
@@ -414,7 +431,10 @@ class Runtime:
         standstill=bool(car_state.standstill) or str(car_state.gearShifter) == 'reverse',
         can_offer=self.settings.enabled and authority.can_control and not host.force_decel,
         confirmation_active=authority.can_control, now_ns=now_ns, pending=self.state.acceptance.pending, live=current,
-        current_unresolved=current_unresolved)
+        current_unresolved=current_unresolved,
+        advance_mode=self.settings.preferences.advance_mode,
+        advance_distance_m=self.settings.preferences.advance_distance_m,
+        advance_decel_mps2=self.settings.preferences.advance_decel_mps2)
     pending = self.state.acceptance.pending
     if pending is not None and pending.candidate.source == 'map' and pending.candidate.speed_mps == self.advance.retired_pending_speed_mps:
       self.state = replace(self.state, acceptance=replace(self.state.acceptance,
@@ -469,8 +489,12 @@ class Runtime:
         _fresh(sm, 'slcDashboardObservation', now_ns) and
         cruise_event.producer_session == str(sm['slcDashboardObservation'].producerSessionId)):
       wheel_since = cruise_event.wheel_override_since_ns
+    step_override_req = self._step_override_event(cruise_event, sm, now_ns) if request is None else None
+    if not self.settings.preferences.step_override_enabled:
+      step_override_req = 0.0
     frame = self._frame(sm, CP, now_ns, now_boot_ns, action, adopt, classified, wheel_override_blocked=wheel_override_blocked)
-    frame = replace(frame, confirmation_grace_ns=confirmation_grace_ns, wheel_override_since_ns=wheel_since)
+    frame = replace(frame, confirmation_grace_ns=confirmation_grace_ns, wheel_override_since_ns=wheel_since,
+                    step_override_request_mps=step_override_req)
     result = comp.step(self.state, frame)
     self.state = result.state
     self.advance.observe(result)
@@ -537,7 +561,10 @@ class Runtime:
     state.displayOnly = self.settings.display and not self.settings.enabled
     state.observationKind = current_selection.observation.kind.value
     state.source = current_selection.selected_source.value if current_selection.selected_source is not None else 'none'
-    if current_selection.observation.candidate is not None:
+    if current_selection.observation.kind is acc.ObservationKind.UNLIMITED:
+      self.last_received = None
+      self.history_limit = None
+    elif current_selection.observation.candidate is not None:
       state.speedLimit = current_selection.observation.candidate.speed_mps
       self.last_received = current_selection.observation.candidate
     if self.advance.boundary_id and result.selection is not None and result.selection.observation.candidate is not None:
@@ -573,9 +600,10 @@ class Runtime:
       state.automaticAdoptionPending = pending.automatic
       state.pendingSinceMonoTime = now_ns - pending.active_elapsed_ns
     wheel_active = result.coordinate is not None and result.coordinate.basis == 'wheel'
+    step_active = result.coordinate is not None and result.coordinate.basis == 'step'
     state.wheelOverrideSince = result.state.wheel_override_since_ns if not result.errors else 0
-    state.driverOverrideActive = wheel_active or result.ceiling is not None and result.state.pedal_target_mps > 0.
-    state.overrideBasis = 'wheel' if wheel_active else (
+    state.driverOverrideActive = wheel_active or step_active or result.ceiling is not None and result.state.pedal_target_mps > 0.
+    state.overrideBasis = 'wheel' if (wheel_active or step_active) else (
       ('pedal' if frame.pedal_pressed else 'persistent') if state.driverOverrideActive else 'none')
     shown = result.state.acceptance.presentation
     ego = frame.ego_pair

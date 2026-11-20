@@ -45,6 +45,9 @@ class MapFrame:
   preview_distance_m: float = 0.0
   preview_boundary_id: str = ''
   preview_way_id: int = 0
+  highway_class: str = ''
+  road_context: str = ''
+  one_way: bool = False
 
 
 @dataclass(frozen=True)
@@ -70,7 +73,9 @@ def copy_frame(road, *, event_valid: bool, event_boot_ns: int) -> MapFrame:
       int(road.sourceGeneration), int(road.producerSession), float(road.speedLimit),
       bool(road.tileLoaded), int(road.wayId), str(road.waySelectionType),
       float(road.previewSpeedLimit), float(road.previewDistance),
-      str(road.previewBoundaryId), int(road.previewWayId))
+      str(road.previewBoundaryId), int(road.previewWayId),
+      str(getattr(road, 'highwayClass', '')), str(getattr(road, 'roadContext', '')),
+      bool(getattr(road, 'oneWay', False)))
   except Exception as error:  # pycapnp lazy reads may raise KjException, not ValueError
     raise ValueError('invalid mapdOut reader') from error
 

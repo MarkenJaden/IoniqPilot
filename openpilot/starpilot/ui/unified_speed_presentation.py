@@ -26,6 +26,7 @@ class UnifiedSpeedPresentation:
   posted_retained: bool = False
   limit_in_use: bool = False
   offset_configured: bool = False
+  unlimited: bool = False
 
   @property
   def max_status(self) -> str:
@@ -40,13 +41,24 @@ def positive(value):
   return value is not None and math.isfinite(value) and value > 0
 
 
+def show_unlimited_sign(observation) -> bool:
+  if str(getattr(observation, 'kind', '')) != 'unlimited':
+    return False
+  from openpilot.starpilot.speed_limits.preferences import load_preferences_cached
+  return load_preferences_cached().unlimited_display != 'hide'
+
+
 def retaining_limit(observation):
+  if str(observation.kind) == 'unlimited':
+    return False
   return (str(observation.kind) != 'valid' and bool(getattr(observation, 'session_id', None)) and
           (positive(observation.last_received_speed_limit_mps) or observation.action_enabled and
            positive(observation.accepted_speed_limit_mps) and positive(observation.effective_cluster_target_mps)))
 
 
 def displayed_limit_mps(observation):
+  if str(observation.kind) == 'unlimited':
+    return None
   if str(observation.kind) == 'valid':
     return observation.speed_limit_mps
   if positive(observation.last_received_speed_limit_mps):
@@ -84,6 +96,24 @@ def resolve_unified_speed(state, *, confirmation=False) -> UnifiedSpeedPresentat
     return str(round(value * factor)) if positive(value) else '–'
   active_target = obs.effective_cluster_target_mps
   pending = positive(obs.pending_speed_limit_mps)
+  if str(obs.kind) == 'unlimited' and not pending:
+    show_sign = show_unlimited_sign(obs)
+    show_max = state.customization.get('showMaxSpeed', True)
+    mode = 'split' if show_max and show_sign else 'limit_only' if show_sign else 'max_only' if show_max else 'hidden'
+    return UnifiedSpeedPresentation(
+      mode=mode,
+      max_text=speed(state.cruise_kph / 3.6) if positive(state.cruise_kph) else '–',
+      posted_text='∞',
+      offset_text=None,
+      unit='km/h' if state.metric else 'mph',
+      source=obs.source if obs.source not in ('', 'none', 'unknown') else 'map',
+      pending=False,
+      active_side='max' if state.cruise_active else 'none',
+      status='Unlimited',
+      proposal_text='–',
+      override_text=None,
+      unlimited=show_sign,
+    )
   slc_on = (state.longitudinal_active or state.longitudinal_overridden) and obs.action_enabled
   slc_engaged = slc_on and not state.longitudinal_overridden
   # SLC shows the limit it uses, even while the driver is on the gas.

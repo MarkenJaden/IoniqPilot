@@ -46,6 +46,7 @@ class Frame:
   wheel_override_blocked: bool = False
   wheel_override_since_ns: int = 0
   filtered_ego_delta_mps: float | None = None
+  step_override_request_mps: float | None = None
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,7 @@ class State:
   pedal_blocked_until_release: bool = False
   wheel_override_metric: bool | None = None
   wheel_override_since_ns: int = 0
+  step_override_mps: float = 0.
 
 
 @dataclass(frozen=True)
@@ -76,7 +78,8 @@ def _state_valid(state: object) -> bool:
   if not isinstance(state, State) or not isinstance(state.acceptance, acc.State):
     return False
   return (type(state.session_id) is str and bool(state.session_id) and state.acceptance.session_id == state.session_id and
-          acc.number(state.pedal_target_mps) and (state.last_now_ns is None or acc.integer(state.last_now_ns)) and
+          acc.number(state.pedal_target_mps) and acc.number(state.step_override_mps) and
+          (state.last_now_ns is None or acc.integer(state.last_now_ns)) and
           type(state.reset_required) is bool and type(state.pedal_blocked_until_release) is bool and
           (state.wheel_override_metric is None or type(state.wheel_override_metric) is bool) and
           acc.integer(state.wheel_override_since_ns))
@@ -119,6 +122,7 @@ def step(state: State, frame: Frame) -> Result:
                                                 frame.wheel_override_enabled, frame.wheel_override_blocked)) or
       not isinstance(frame.selected_kind, sd.DomainStatus) or not isinstance(frame.ego_pair, sd.SpeedPair) or
       (frame.filtered_ego_delta_mps is not None and not acc.number(frame.filtered_ego_delta_mps)) or
+      (frame.step_override_request_mps is not None and not acc.number(frame.step_override_request_mps)) or
       (frame.is_metric is not None and type(frame.is_metric) is not bool)):
     return Result(replace(state, reset_required=True), status="invalid_frame", errors=("invalid frame or clock",))
   host = frame.host
@@ -132,7 +136,8 @@ def step(state: State, frame: Frame) -> Result:
   engaged_path = (frame.authority.can_control and (host_long or frame.authority.accelerator_override) and
                   selected_initialized and not frame.acceptance_policy.display_only)
   active_path = engaged_path and not host.force_decel
-  base = replace(state, last_now_ns=frame.now_ns, pedal_target_mps=0., wheel_override_metric=None, wheel_override_since_ns=0)
+  base = replace(state, last_now_ns=frame.now_ns, pedal_target_mps=0., wheel_override_metric=None,
+                 wheel_override_since_ns=0, step_override_mps=0.)
 
   if frame.classified_cruise is not None:
     classified = frame.classified_cruise
@@ -217,6 +222,30 @@ def step(state: State, frame: Frame) -> Result:
     if wheel_metric is not None:
       coordinate = sd.PlannerCoordinate(None, 'wheel', selected_cluster, context.ego_delta_mps)
       return Result(base, selected, acceptance, domain, coordinate, status=acceptance.basis)
+
+  step_target = (0. if clear_wheel or frame.step_override_request_mps == 0. else
+                 float(frame.step_override_request_mps)
+                 if frame.step_override_request_mps is not None and frame.step_override_request_mps > 0.
+                 else state.step_override_mps)
+  if step_target > 0.:
+    base = replace(base, step_override_mps=step_target, pedal_target_mps=0.)
+    if step_target >= selected_cluster:
+      coordinate = sd.PlannerCoordinate(None, 'step', selected_cluster, context.ego_delta_mps)
+      return Result(base, selected, acceptance, domain, coordinate, status=acceptance.basis)
+    coordinate = sd.to_planner_coordinate(context, override_mps=step_target, allow_below_limit=True)
+    if coordinate.cap_mps is None:
+      return Result(replace(base, reset_required=True), selected, acceptance, domain, coordinate,
+                    status="invalid_coordinate", errors=("planner coordinate unavailable",))
+    if frame.filtered_ego_delta_mps is not None:
+      coordinate = sd.to_planner_coordinate(replace(context, ego_delta_mps=frame.filtered_ego_delta_mps),
+                                             override_mps=step_target, allow_below_limit=True)
+      if coordinate.cap_mps is None:
+        return Result(replace(base, reset_required=True), selected, acceptance, domain, coordinate,
+                      status="invalid_coordinate", errors=("planner coordinate unavailable",))
+    coordinate = replace(coordinate, basis='step')
+    return Result(base, selected, acceptance, domain, coordinate,
+                  ceiling=CruiseCeiling(coordinate.cap_mps, frame.authority),
+                  status=acceptance.basis)
 
   pedal_target = 0.
   if frame.pedal_override is not PedalOverride.OFF:

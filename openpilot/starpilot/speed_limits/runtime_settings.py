@@ -1,13 +1,14 @@
 """Reviewed saved-setting mapping for the opt-in system-longitudinal SLC runtime."""
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
 
 from openpilot.starpilot.saved_source import read_saved
 from openpilot.starpilot.speed_limits import acceptance as acc
 from openpilot.starpilot.speed_limits import offset_document as od
+from openpilot.starpilot.speed_limits import preferences as slc_prefs
 from openpilot.starpilot.speed_limits import selection as sel
 from openpilot.starpilot.speed_limits import speed_domain as sd
 
@@ -18,7 +19,7 @@ SOURCE_PRIORITY_MAX_BYTES = 32
 CONFIRMATION_CHOICES = {0: 'Off', 1: 'Both', 3: 'Higher only', 4: 'Lower only'}
 CONFIRMATION_BYTES = tuple(str(mode).encode() for mode in CONFIRMATION_CHOICES)
 ADVANCE_KEYS = ('SLCAdvanceHigherSeconds', 'SLCAdvanceLowerSeconds')
-ADVANCE_SECONDS = range(11)
+ADVANCE_SECONDS = range(slc_prefs.ADVANCE_SECONDS_MAX + 1)
 ADVANCE_BYTES = tuple(str(seconds).encode() for seconds in ADVANCE_SECONDS)
 
 PEDAL_OVERRIDE_KEY = 'SLCOverrideMode'
@@ -47,6 +48,7 @@ class Settings:
   advance_lower_seconds: int = 0
   pedal_override: PedalOverride = PedalOverride.OFF
   wheel_override: bool = False
+  preferences: slc_prefs.SlcPreferences = field(default_factory=slc_prefs.SlcPreferences)
 
 
 def _bool(values: Mapping[str, object], key: str, default: bool = False) -> bool:
@@ -95,9 +97,17 @@ def parse(values: Mapping[str, object]) -> Settings:
     pedal_override = values.get(PEDAL_OVERRIDE_KEY, PedalOverride.SPEED_REACHED.value)
     if type(pedal_override) is not int or pedal_override not in (0, 1, 2):
       pedal_override = PedalOverride.OFF.value
+    raw_prefs = values.get('SLCPreferences')
+    if isinstance(raw_prefs, slc_prefs.SlcPreferences):
+      prefs = raw_prefs
+    elif isinstance(raw_prefs, Mapping):
+      prefs = slc_prefs.normalize_preferences(dict(raw_prefs))
+    else:
+      prefs = slc_prefs.SlcPreferences()
     return Settings(control, display, sel.SelectionPolicy(mode, slots, False), policy, offsets,
                     requested=control, advance_higher_seconds=higher, advance_lower_seconds=lower,
-                    pedal_override=PedalOverride(pedal_override), wheel_override=values.get(WHEEL_OVERRIDE_KEY) is True)
+                    pedal_override=PedalOverride(pedal_override), wheel_override=values.get(WHEEL_OVERRIDE_KEY) is True,
+                    preferences=prefs)
   except (ValueError, OverflowError) as error:
     return _disabled(str(error))
 
@@ -156,4 +166,5 @@ def read_params(params) -> Settings:
       continue
     except (OSError, ValueError, OverflowError):
       return _disabled(f'Invalid saved {key}')
+  values['SLCPreferences'] = slc_prefs.load_preferences()
   return parse(values)
