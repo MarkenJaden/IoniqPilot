@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 import hashlib
+import json
 from pathlib import Path
 import secrets
 import threading
@@ -17,6 +18,7 @@ from openpilot.starpilot.ioniq.button_learner import (
   read_buttons_state,
   write_buttons_state,
 )
+from openpilot.starpilot.ioniq.can_discovery import CanFuelDiscoveryRecorder
 from openpilot.starpilot.ioniq.can_signals import IoniqCanState
 from openpilot.starpilot.ioniq.dtc_catalog import analyze_dtcs
 from openpilot.starpilot.ioniq.fuel_tracker import FuelTripTracker, write_fuel_state
@@ -122,6 +124,7 @@ class IoniqTools:
       tank_capacity_liters=float(cfg.get('tankCapacityLiters', 45.0)),
     ).snapshot()
     recorder_status = EventFlightRecorder(self.root).status()
+    discovery_status = CanFuelDiscoveryRecorder(self.root).status(live_override=diag.get('discoveryStatus'))
 
     # Ensure analysis stays fresh against latest passive warnings
     if isinstance(diag.get('lastScan'), dict):
@@ -142,6 +145,7 @@ class IoniqTools:
       'buttonActions': list(BUTTON_ACTIONS),
       'fuel': fuel,
       'recordings': recorder_status,
+      'discovery': discovery_status,
     }
 
   def action(self, payload: Any, token: str, generation: bytes, *, session_valid: Callable[[], bool] | None = None) -> dict[str, Any]:
@@ -170,7 +174,7 @@ class IoniqTools:
     parked_only_actions = frozenset((
       'clear_dtcs', 'save_config', 'start_learn', 'cancel_learn',
       'delete_binding', 'update_binding', 'delete_recording', 'delete_trip',
-      'delete_refuel', 'reset_fuel_calibration',
+      'delete_refuel', 'reset_fuel_calibration', 'delete_can_discovery',
     ))
     if act in parked_only_actions and not parked:
       raise IoniqToolsChanged('Car must be parked for this operation')
@@ -447,6 +451,37 @@ class IoniqTools:
     if act == 'export_trips_csv':
       csv_text = FuelTripTracker(self.root).export_csv()
       return {'ok': True, 'filename': 'ioniq-trips.csv', 'csv': csv_text}
+
+    if act == 'start_can_discovery':
+      label = str(payload.get('label', 'Verbrauchsanalyse')).strip()[:64] or 'Verbrauchsanalyse'
+      push_runtime_command('start_can_discovery', {'label': label}, root=self.root)
+      return {'saved': True, 'queued': True}
+
+    if act == 'stop_can_discovery':
+      dash_l100 = _parse_optional_float(payload.get('dashboardLPer100Km'))
+      dash_km = _parse_optional_float(payload.get('dashboardDistanceKm'))
+      notes = str(payload.get('notes', '')).strip()[:160]
+      push_runtime_command(
+        'stop_can_discovery',
+        {'dashboardLPer100Km': dash_l100, 'dashboardDistanceKm': dash_km, 'notes': notes},
+        root=self.root,
+      )
+      return {'saved': True, 'queued': True}
+
+    if act == 'export_can_discovery':
+      cap_id = str(payload.get('id', ''))
+      bundle = CanFuelDiscoveryRecorder(self.root).read_capture(cap_id)
+      if bundle is None:
+        raise ValueError('Capture not found')
+      return {'ok': True, 'filename': f'{cap_id}.json', 'json': json.dumps(bundle, indent=2, ensure_ascii=False)}
+
+    if act == 'delete_can_discovery':
+      if payload.get('confirmed') is not True:
+        raise ValueError('Confirmation required')
+      cap_id = str(payload.get('id', ''))
+      if not CanFuelDiscoveryRecorder(self.root).delete_capture(cap_id):
+        raise ValueError('Capture not found')
+      return {'saved': True}
 
     raise ValueError(f'Unknown action: {act}')
 

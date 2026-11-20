@@ -7,6 +7,7 @@ import tempfile
 import unittest
 
 from openpilot.starpilot.ioniq.can_signals import (
+  ADDR_ACU11,
   ADDR_BAT11,
   ADDR_CLU12,
   ADDR_CLU13,
@@ -14,14 +15,19 @@ from openpilot.starpilot.ioniq.can_signals import (
   ADDR_EMS11,
   ADDR_EMS12,
   ADDR_EMS14,
+  ADDR_EMS19,
   ADDR_EMS20,
   ADDR_EMS_DCT11,
   ADDR_EMS_H12,
+  ADDR_EPB11,
   ADDR_ESP12,
   ADDR_E_EMS11,
+  ADDR_LFAHDA_MFC,
+  ADDR_MDPS12,
   ADDR_SCC12,
   ADDR_TCU14,
   ADDR_TCS13,
+  ADDR_TPMS11,
   ADDR_WHL_SPD11,
   IoniqCanState,
 )
@@ -387,6 +393,116 @@ class TestCanAndDtc(unittest.TestCase):
     self.assertTrue(st2.has_direct_engine_rpm())
     self.assertAlmostEqual(st2.engine_rpm, 2100.0)
     self.assertTrue(st2.engine_is_firing())
+
+  def test_expanded_can_faults_sna_and_live_ecu_matrix(self) -> None:
+    st = IoniqCanState()
+    st.apply_frame(10.0, ADDR_EMS11, encode_intel([(0, 1, 1), (1, 1, 1), (16, 16, 6000), (48, 8, 50)]), bus=0)
+    # SNA values (0x3, 0x7, 0xFF, 0xFFFF) on SCC12, LFAHDA_MFC, EPB11, TPMS11, ACU11 must NOT fault
+    st.apply_frame(10.0, ADDR_SCC12, encode_intel([(11, 2, 0x3), (50, 2, 0x3)]), bus=0)
+    st.apply_frame(10.0, ADDR_LFAHDA_MFC, encode_intel([(16, 3, 0x7)]), bus=0)
+    st.apply_frame(10.0, ADDR_EPB11, encode_intel([(4, 2, 0x3), (29, 3, 0x7)]), bus=0)
+    st.apply_frame(10.0, ADDR_TPMS11, encode_intel([(0, 2, 0x3), (2, 2, 0x3)]), bus=0)
+    st.apply_frame(10.0, ADDR_ACU11, encode_intel([(34, 2, 0x3), (40, 16, 0xFFFF), (56, 8, 0xFF)]), bus=0)
+    mon = PassiveEcuMonitor(boot_blanking_s=0.0, debounce_s=0.0, min_samples=1)
+    self.assertEqual(mon.update(st, wall_time=1000.0), [])
+
+    # Trigger expanded real faults + EMS14 FCO + EMS19 + MDPS12 + TCS13
+    st.apply_frame(10.5, ADDR_EMS14, encode_intel([(8, 16, 4321)]), bus=0)
+    st.apply_frame(10.5, ADDR_EMS19, encode_intel([(32, 8, 160), (42, 1, 1), (56, 1, 1)]), bus=0)
+    st.apply_frame(10.5, ADDR_EMS12, encode_intel([(8, 8, 208)]), bus=0)  # 208*0.75-48 = 108 C (>105 C)
+    st.apply_frame(10.5, ADDR_MDPS12, encode_intel([(11, 1, 1)]), bus=0)
+    st.apply_frame(10.5, ADDR_TCS13, encode_intel([(43, 2, 2)]), bus=0)
+    st.apply_frame(10.5, ADDR_SCC12, encode_intel([(11, 2, 1), (50, 2, 2)]), bus=0)
+    st.apply_frame(10.5, ADDR_LFAHDA_MFC, encode_intel([(16, 3, 3)]), bus=0)
+    st.apply_frame(10.5, ADDR_EPB11, encode_intel([(4, 2, 1)]), bus=0)
+    st.apply_frame(10.5, ADDR_TPMS11, encode_intel([(0, 2, 1), (4, 1, 1), (7, 1, 1)]), bus=0)
+    st.apply_frame(10.5, ADDR_ACU11, encode_intel([(34, 2, 1), (40, 16, 0x1234), (56, 8, 1)]), bus=0)
+
+    self.assertEqual(st.ems14_fco_raw, 4321)
+    self.assertAlmostEqual(st.eng_oil_temp_c or 0.0, 80.0)
+    self.assertIn('0x545', st.raw_fuel_frames)
+
+    events = mon.update(st, wall_time=1001.0)
+    codes = {ev['code'] for ev in events}
+    self.assertEqual(codes, {
+      'MDPS_FAULT', 'SCC_FAULT', 'AEB_FAULT', 'LKAS_FAULT', 'EPB_FAULT',
+      'TPMS_WARN', 'ACU_AIRBAG', 'EMS_OIL_PRESSURE', 'EMS_ALT_LAMP', 'COOLANT_OVERHEAT',
+    })
+    tpms_ev = next(ev for ev in events if ev['code'] == 'TPMS_WARN')
+    self.assertIn('VL', tpms_ev['message'])
+    self.assertIn('HR', tpms_ev['message'])
+    acu_ev = next(ev for ev in events if ev['code'] == 'ACU_AIRBAG')
+    self.assertIn('0x1234', acu_ev['message'])
+
+    matrix = st.live_ecu_matrix(11.0, stale_s=5.0)
+    by_id = {item['ecuId']: item for item in matrix}
+    self.assertTrue(by_id['ECM']['online'])
+    self.assertTrue(by_id['MDPS']['online'])
+    self.assertFalse(by_id['DATC']['online'])
+    stale_matrix = st.live_ecu_matrix(20.0, stale_s=5.0)
+    self.assertFalse(next(item for item in stale_matrix if item['ecuId'] == 'ECM')['online'])
+
+  def test_dual_bus_scan_and_obd_supported_pids(self) -> None:
+    class DualBusIsoTp(MockIsoTpBus):
+      def can_send(self, msgs: list[MockFrame]) -> None:
+        for msg in msgs:
+          addr = int(msg.address)
+          dat = bytes(msg.dat)
+          src = int(msg.src)
+          length = dat[0] & 0x0F
+          req = dat[1:1 + length]
+          # MFC (0x7C4/0x7CC) only answers on Bus 0 (C-CAN), while 0x7E0 answers on Bus 1 + supports PID mask 0x00
+          if addr == 0x7C4 and src == 0 and req[:2] == b'\x19\x02':
+            self.inbox.append([MockFrame(0x7CC, bytes([0x07, 0x59, 0x02, 0xFF, 0xC1, 0x00, 0x00, 0x09]), 0)])
+            continue
+          if addr == 0x7C4 and src == 0 and req[:2] == b'\x22\xF1':
+            p = b'\x62\xF1\x87MFC-AE' if req[2] == 0x87 else b'\x62\xF1\x951.00'
+            if len(p) <= 7:
+              self.inbox.append([MockFrame(0x7CC, (bytes([len(p)]) + p).ljust(8, b'\xAA'), 0)])
+            else:
+              ff = bytes([0x10, len(p)]) + p[:6]
+              self._multiframe_queues[0x7CC] = [(b'\x21' + p[6:]).ljust(8, b'\xAA')]
+              self.inbox.append([MockFrame(0x7CC, ff, 0)])
+            continue
+          if addr == 0x7C4 and src == 0 and req[:2] == b'\x19\x04':
+            self.inbox.append([MockFrame(0x7CC, b'\x07\x59\x04\xC1\x00\x00\x09\xAA', 0)])
+            continue
+          if addr == 0x7E0 and src == 1 and req[:1] == b'\x01' and len(req) >= 2 and req[1] in (0x00, 0x20, 0x40):
+            if req[1] == 0x00:
+              # Support PIDs 0x01, 0x05, 0x0C, 0x0D, 0x10, 0x20
+              mask = (1 << 31) | (1 << 27) | (1 << 20) | (1 << 19) | (1 << 16) | (1 << 0)
+            elif req[1] == 0x20:
+              # Support PIDs 0x2F, 0x40
+              mask = (1 << 17) | (1 << 0)
+            else:
+              # Support PIDs 0x42, 0x5E
+              mask = (1 << 30) | (1 << 2)
+            p = bytes([0x41, req[1]]) + mask.to_bytes(4, 'big')
+            self.inbox.append([MockFrame(0x7E8, (bytes([len(p)]) + p).ljust(8, b'\xAA'), 1)])
+            continue
+          super().can_send([msg])
+
+    bus = DualBusIsoTp()
+    mux_calls: list[bool] = []
+    res = scan_ioniq_ecus(
+      bus.can_send,
+      bus.can_recv,
+      bus=1,
+      fallback_bus=0,
+      set_obd_multiplexing=mux_calls.append,
+      timeout_s=0.05,
+    )
+    self.assertEqual(mux_calls, [False])
+    self.assertEqual(res['transport'], 'isotp_elm327_dual_bus')
+    mfc = next(e for e in res['ecus'] if e['ecuId'] == 'MFC')
+    self.assertTrue(mfc['online'])
+    self.assertEqual(mfc['busUsed'], 0)
+    self.assertEqual(mfc['partNumber'], 'MFC-AE')
+    ecm = next(e for e in res['ecus'] if e['ecuId'] == 'ECM')
+    self.assertEqual(ecm['busUsed'], 1)
+    self.assertIn('0x01', res['obdSupportedPids'])
+    self.assertIn('0x5E', res['obdSupportedPids'])
+    self.assertAlmostEqual(res['obdLive']['fuelRateLph'], 3.6)
 
 
 if __name__ == '__main__':

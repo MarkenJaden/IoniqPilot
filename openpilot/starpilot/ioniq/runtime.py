@@ -18,6 +18,7 @@ from openpilot.starpilot.ioniq.button_learner import (
   read_buttons_state,
   write_buttons_state,
 )
+from openpilot.starpilot.ioniq.can_discovery import CanFuelDiscoveryRecorder
 from openpilot.starpilot.ioniq.can_signals import IoniqCanState
 from openpilot.starpilot.ioniq.fuel_tracker import FuelTripTracker
 from openpilot.starpilot.ioniq.recorder import EventFlightRecorder
@@ -100,24 +101,45 @@ def maybe_run_startup_diagnostic(
     return None
 
   result: dict[str, Any] = {'ranClear': False, 'ranScan': False}
+  obd_mux_on = False
+
+  def _set_mux(enabled: bool) -> None:
+    nonlocal obd_mux_on
+    if enabled != obd_mux_on:
+      set_obd_multiplexing(enabled)
+      obd_mux_on = enabled
+
   try:
-    set_obd_multiplexing(True)
     if should_clear:
+      _set_mux(True)
       target = str(pending.get('target', 'ALL')) if isinstance(pending, dict) else 'ALL'
-      clear_res = clear_ioniq_dtcs(can_send, can_recv, target_ecu=target, bus=1)
+      clear_res = clear_ioniq_dtcs(
+        can_send, can_recv, target_ecu=target, bus=1, fallback_bus=0, set_obd_multiplexing=_set_mux,
+      )
       apply_clear_result(clear_res, root=root)
       result['ranClear'] = True
       result['clear'] = clear_res
     if should_scan:
-      scan_res = scan_ioniq_ecus(can_send, can_recv, bus=1, read_identities=True, timeout_s=0.45)
+      _set_mux(True)
+      scan_res = scan_ioniq_ecus(
+        can_send,
+        can_recv,
+        bus=1,
+        fallback_bus=0,
+        set_obd_multiplexing=_set_mux,
+        read_identities=True,
+        timeout_s=0.35,
+        total_budget_s=2.2,
+      )
       apply_scan_result(scan_res, root=root)
       result['ranScan'] = True
       result['scan'] = scan_res
   finally:
-    try:
-      set_obd_multiplexing(False)
-    except Exception:
-      pass
+    if obd_mux_on:
+      try:
+        _set_mux(False)
+      except Exception:
+        pass
   return result
 
 
@@ -137,6 +159,7 @@ class IoniqRuntimeController:
       pre_seconds=float(self.cfg.get('recorderPreSeconds', 30.0)),
       post_seconds=float(self.cfg.get('recorderPostSeconds', 10.0)),
     )
+    self.discovery = CanFuelDiscoveryRecorder(self.root)
     self.learner = ButtonLearnEngine()
     self.matcher = ButtonMatcher()
     self.fuel = FuelTripTracker(
@@ -154,6 +177,7 @@ class IoniqRuntimeController:
     self._last_learn_sync_mono = -1e9
     self._last_learn_state = 'idle'
     self._last_diag_sync_mono = -1e9
+    self._diag_dirty = False
 
   def _file_mtime(self, path: Path) -> int:
     try:
@@ -167,7 +191,7 @@ class IoniqRuntimeController:
     self._mtimes['fuel'] = self._file_mtime(self.root / 'fuel.json')
     self._mtimes['commands'] = self._file_mtime(commands_path(self.root))
 
-  def _reload_external_changes(self, mono_s: float) -> None:
+  def _reload_external_changes(self, mono_s: float, *, wall_time: float | None = None) -> None:
     cfg_changed = False
     cfg_mtime = self._file_mtime(self.root / 'config.json')
     if cfg_mtime != self._mtimes.get('config'):
@@ -210,11 +234,11 @@ class IoniqRuntimeController:
         self._mtimes['commands'] = self._file_mtime(cmd_path)
         for item in queue:
           if isinstance(item, dict):
-            self._handle_command(item, mono_s=mono_s)
+            self._handle_command(item, mono_s=mono_s, wall_time=wall_time)
       else:
         self._mtimes['commands'] = cmd_mtime
 
-  def _handle_command(self, item: dict[str, Any], *, mono_s: float) -> None:
+  def _handle_command(self, item: dict[str, Any], *, mono_s: float, wall_time: float | None = None) -> None:
     cmd = item.get('command')
     args = item.get('args') if isinstance(item.get('args'), dict) else {}
     if cmd == 'start_learn':
@@ -233,6 +257,22 @@ class IoniqRuntimeController:
       self.recorder.start_continuous(label, mono_s=mono_s)
     elif cmd == 'stop_continuous_recording':
       self.recorder.stop_continuous()
+    elif cmd == 'start_can_discovery':
+      label = str(args.get('label', 'Verbrauchsanalyse'))
+      self.discovery.start(label=label, mono_s=mono_s, wall_time=wall_time)
+      self._diag_dirty = True
+    elif cmd == 'stop_can_discovery':
+      raw_l100 = args.get('dashboardLPer100Km')
+      raw_km = args.get('dashboardDistanceKm')
+      dash_l100 = float(raw_l100) if isinstance(raw_l100, (int, float)) else None
+      dash_km = float(raw_km) if isinstance(raw_km, (int, float)) else None
+      self.discovery.stop(
+        dashboard_l_per_100km=dash_l100,
+        dashboard_distance_km=dash_km,
+        notes=str(args.get('notes', '')),
+        wall_time=wall_time,
+      )
+      self._diag_dirty = True
     elif cmd == 'start_manual_trip':
       self.fuel.start_manual_trip(label=str(args.get('label', '')))
       self._mtimes['fuel'] = self._file_mtime(self.root / 'fuel.json')
@@ -290,7 +330,7 @@ class IoniqRuntimeController:
     now = wall_time if wall_time is not None else _utc_timestamp()
     if (mono_s - self._last_sync_mono) >= 0.4:
       self._last_sync_mono = mono_s
-      self._reload_external_changes(mono_s)
+      self._reload_external_changes(mono_s, wall_time=now)
 
     if car_state_msg is not None:
       self.can_state.apply_car_state(car_state_msg, mono_s)
@@ -300,6 +340,8 @@ class IoniqRuntimeController:
 
     for bus, address, data in frames:
       self.can_state.apply_frame(mono_s, address, data, bus=bus)
+      if self.discovery.active:
+        self.discovery.observe_frame(bus, address, data, engine_firing=self.can_state.engine_is_firing())
 
       if self.learner.state in ('sampling_baseline', 'listening'):
         learned = self.learner.feed_frame(mono_s, bus, address, data)
@@ -343,17 +385,22 @@ class IoniqRuntimeController:
 
     # Fuel & Trip update
     fuel_snap = self.fuel.update(self.can_state, mono_s, wall_time=now, ignition_hint=ignition_hint)
+    if self.discovery.active:
+      self.discovery.record_tick(self.can_state, fuel_snap, mono_s, wall_time=now)
     if self._file_mtime(self.root / 'fuel.json') != self._mtimes.get('fuel'):
       self._mtimes['fuel'] = self._file_mtime(self.root / 'fuel.json')
 
-    # Persist passive diagnostic warnings & live snapshot every 2s or on new fault
-    if new_faults or (mono_s - self._last_diag_sync_mono) >= 2.0:
+    # Persist passive diagnostic warnings & live snapshot every 2s or on new fault / command
+    if new_faults or self._diag_dirty or (mono_s - self._last_diag_sync_mono) >= 2.0:
       self._last_diag_sync_mono = mono_s
+      self._diag_dirty = False
       diag = read_diagnostics_state(self.root)
       diag['passive'] = self.monitor.snapshot()
       live_summary = self.can_state.summary()
       live_summary['instantFuelRateLph'] = round(float(fuel_snap.get('sourceDiagnostics', {}).get('instantFuelRateLph', 0.0)), 2)
       diag['liveSummary'] = live_summary
+      diag['liveEcus'] = self.can_state.live_ecu_matrix(mono_s)
+      diag['discoveryStatus'] = self.discovery.live_status()
       diag['recorderStatus'] = {
         'continuousActive': self.recorder._continuous_session is not None,
         'ringBufferSamples': len(self.recorder._ring),
@@ -393,6 +440,7 @@ class IoniqRuntimeController:
     }
 
   def shutdown(self) -> None:
+    self.discovery.flush()
     self.recorder.flush()
     self.fuel.end_trip()
     self.fuel.flush(0.0)

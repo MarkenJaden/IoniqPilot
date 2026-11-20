@@ -12,10 +12,12 @@ ADDR_TCU_DCT13 = 0x162   # 354
 ADDR_EMS_H12 = 0x18F     # 399
 ADDR_EMS20 = 0x200       # 512
 ADDR_ESP12 = 0x220       # 544
+ADDR_MDPS12 = 0x251      # 593
 ADDR_EMS16 = 0x260       # 608
 ADDR_EMS13 = 0x280       # 640
 ADDR_EMS11 = 0x316       # 790
 ADDR_EMS12 = 0x329       # 809
+ADDR_LKAS11 = 0x340      # 832
 ADDR_EMS_366 = 0x366     # 870
 ADDR_E_EMS11 = 0x371     # 881
 ADDR_ELECT_GEAR = 0x372  # 882
@@ -23,7 +25,13 @@ ADDR_WHL_SPD11 = 0x386   # 902
 ADDR_ABS11 = 0x38A       # 906
 ADDR_FCA11 = 0x38D       # 909
 ADDR_TCS13 = 0x394       # 916
+ADDR_SCC11 = 0x420       # 1056
 ADDR_SCC12 = 0x421       # 1057
+ADDR_P_STS = 0x470       # 1136
+ADDR_LFAHDA_MFC = 0x485  # 1157
+ADDR_EPB11 = 0x490       # 1168
+ADDR_EMS19 = 0x492       # 1170
+ADDR_CLU11 = 0x4F1       # 1265
 ADDR_TCU14 = 0x502       # 1282
 ADDR_TCS15 = 0x507      # 1287
 ADDR_CLU13 = 0x50C      # 1292
@@ -33,7 +41,45 @@ ADDR_EMS15 = 0x547      # 1351
 ADDR_BAT11 = 0x549      # 1353
 ADDR_TCU_DCT14 = 0x54C  # 1356
 ADDR_ENG_FRZ_11 = 0x556  # 1366
+ADDR_LCA11 = 0x58B      # 1419
+ADDR_TPMS11 = 0x593     # 1427
+ADDR_HEV_595 = 0x595    # 1429
+ADDR_ACU11 = 0x5A0      # 1440
 ADDR_CLU12 = 0x5B0      # 1456
+
+WATCHED_FUEL_ADDRS: frozenset[int] = frozenset((
+  ADDR_EMS_H12,
+  ADDR_EMS20,
+  ADDR_EMS16,
+  ADDR_EMS11,
+  ADDR_EMS12,
+  ADDR_EMS_366,
+  ADDR_E_EMS11,
+  ADDR_CLU13,
+  ADDR_CLU15,
+  ADDR_EMS14,
+  ADDR_EMS15,
+  ADDR_BAT11,
+  ADDR_HEV_595,
+  ADDR_CLU12,
+))
+
+LIVE_ECU_CHANNELS: tuple[tuple[str, str, tuple[int, ...]], ...] = (
+  ('ECM', 'Motorsteuergerät (1.6 GDi Kappa)', (ADDR_EMS11, ADDR_EMS12, ADDR_EMS16, ADDR_EMS14, ADDR_EMS15, ADDR_EMS20, ADDR_EMS_366, ADDR_EMS19)),
+  ('TCU', 'Getriebesteuergerät (6-Gang DCT)', (ADDR_TCU_DCT13, ADDR_TCU_DCT14, ADDR_TCU14)),
+  ('HCU', 'Hybrid-Steuergerät (HCU / VCU)', (ADDR_EMS_H12, ADDR_E_EMS11, ADDR_HEV_595, ADDR_P_STS)),
+  ('SCC', 'Frontradar (Smart Cruise Control)', (ADDR_SCC11, ADDR_SCC12, ADDR_FCA11)),
+  ('ESC', 'ABS / ESC / Bremse', (ADDR_WHL_SPD11, ADDR_ABS11, ADDR_TCS13, ADDR_TCS15)),
+  ('MDPS', 'Servolenkung (MDPS / EPS)', (ADDR_MDPS12,)),
+  ('MFC', 'Frontkamera (LKAS / AEB)', (ADDR_LKAS11, ADDR_LFAHDA_MFC)),
+  ('CLU', 'Kombiinstrument (Tacho)', (ADDR_CLU11, ADDR_CLU12, ADDR_CLU13, ADDR_CLU15)),
+  ('DATC', 'Klimaautomatik (DATC)', (ADDR_DATC11,)),
+  ('IBS', '12V-Batteriesensor (BAT11)', (ADDR_BAT11,)),
+  ('EPB', 'Elektrische Parkbremse (EPB)', (ADDR_EPB11,)),
+  ('TPMS', 'Reifendruckkontrolle (TPMS)', (ADDR_TPMS11,)),
+  ('ACU', 'Airbag-Steuergerät (ACU)', (ADDR_ACU11,)),
+  ('BSD', 'Totwinkelradar (BSM / BSD)', (ADDR_LCA11,)),
+)
 
 
 def extract_intel(data: bytes | bytearray | memoryview, start_bit: int, length: int, *,
@@ -61,6 +107,9 @@ class IoniqCanState:
   last_update_s: float = 0.0
   seen_addresses: dict[int, float] = field(default_factory=dict)
   seen_bus0_addresses: set[int] = field(default_factory=set)
+  seen_address_bus: dict[int, int] = field(default_factory=dict)
+  address_counts: dict[int, int] = field(default_factory=dict)
+  raw_fuel_frames: dict[str, str] = field(default_factory=dict)
 
   # Powertrain / Engine / Hybrid (EMS11, EMS12, EMS14, EMS_H12, EMS20)
   ignition_on: bool | None = None
@@ -84,6 +133,10 @@ class IoniqCanState:
   fuel_cut_idle_stop: bool = False
   fuel_cut_open: bool = False
   fco_raw: int | None = None
+  ems14_fco_raw: int | None = None
+  eng_oil_temp_c: float | None = None
+  bat_lamp_stat: bool = False
+  ops_fail: bool = False
   mil_lamp: bool = False
   limp_home_mode: bool = False
   ec_fail: bool = False
@@ -102,6 +155,7 @@ class IoniqCanState:
   dte_km: int | None = None
   drive_mode_switch: int = 0
   active_eco_switch: bool = False
+  alt_lamp_status: bool = False
 
   # 12V Battery Sensor (BAT11)
   bat_12v_soc_pct: float | None = None
@@ -135,6 +189,21 @@ class IoniqCanState:
   tcs_off_lamp: int = 0
   fca11_raw_fail_info: int = 0
   fca_fail_info: int = 0
+  mdps_def: bool = False
+  mdps_fail_stat: bool = False
+  mdps_serr: bool = False
+  tcs13_acc_enable: int = 0
+  scc_fail_info: int = 0
+  aeb_fail_info: int = 0
+  lfa_sys_warning: int = 0
+  epb_f_lamp: int = 0
+  epb_fail: int = 0
+  tpms_w_lamp: int = 0
+  tread_w_lamp: int = 0
+  tpms_pos_warn: tuple[bool, bool, bool, bool] = (False, False, False, False)
+  acu_flt_stat: int = 0
+  acu_dtc_raw: int = 0
+  acu_num_flt: int = 0
   freeze_frame_rpm: float | None = None
   freeze_frame_load_pct: float | None = None
 
@@ -410,6 +479,10 @@ class IoniqCanState:
       return
     self.last_update_s = ts
     self.seen_addresses[address] = ts
+    self.seen_address_bus[address] = bus
+    self.address_counts[address] = self.address_counts.get(address, 0) + 1
+    if address in WATCHED_FUEL_ADDRS:
+      self.raw_fuel_frames[f'0x{address:03X}'] = bytes(data).hex()
 
     if address == ADDR_EMS11 and len(data) >= 7:
       self.ignition_on = bool(extract_intel(data, 0, 1))
@@ -476,20 +549,27 @@ class IoniqCanState:
       self.gas_pedal_pct = round(min(100.0, max(0.0, acc_pct, vcu_pct)), 1)
     elif address == ADDR_ELECT_GEAR and len(data) >= 3:
       self.gear_shifter_raw = int(extract_intel(data, 16, 4))
-    elif address == ADDR_TCS13 and len(data) >= 7:
-      raw_ab = int(extract_intel(data, 0, 11))
-      if raw_ab != 0x7FF:
-        self.tcs_a_basis_mps2 = float(raw_ab * 0.01 - 10.23)
-      self.tcs_brake_light = bool(extract_intel(data, 11, 1))
-      self.tqi_scc_pct = float(extract_intel(data, 24, 8, scale=0.390625))
-      self.tcs_driver_override = int(extract_intel(data, 45, 2))
-      self.tcs_acc_req = bool(extract_intel(data, 54, 1))
-      self.tcs_driver_braking = bool(extract_intel(data, 55, 1))
-    elif address == ADDR_SCC12 and len(data) >= 7:
-      self.scc_acc_mode = int(extract_intel(data, 13, 2))
-      raw_req = int(extract_intel(data, 37, 11))
-      if raw_req != 0x7FF:
-        self.scc_a_req_mps2 = float(raw_req * 0.01 - 10.23)
+    elif address == ADDR_TCS13 and len(data) >= 6:
+      self.tcs13_acc_enable = int(extract_intel(data, 43, 2))
+      if len(data) >= 7:
+        raw_ab = int(extract_intel(data, 0, 11))
+        if raw_ab != 0x7FF:
+          self.tcs_a_basis_mps2 = float(raw_ab * 0.01 - 10.23)
+        self.tcs_brake_light = bool(extract_intel(data, 11, 1))
+        self.tqi_scc_pct = float(extract_intel(data, 24, 8, scale=0.390625))
+        self.tcs_driver_override = int(extract_intel(data, 45, 2))
+        self.tcs_acc_req = bool(extract_intel(data, 54, 1))
+        self.tcs_driver_braking = bool(extract_intel(data, 55, 1))
+    elif address == ADDR_SCC12 and len(data) >= 2:
+      raw_acc_fail = int(extract_intel(data, 11, 2))
+      self.scc_fail_info = 0 if raw_acc_fail == 0x3 else raw_acc_fail
+      if len(data) >= 7:
+        self.scc_acc_mode = int(extract_intel(data, 13, 2))
+        raw_req = int(extract_intel(data, 37, 11))
+        if raw_req != 0x7FF:
+          self.scc_a_req_mps2 = float(raw_req * 0.01 - 10.23)
+        raw_aeb_fail = int(extract_intel(data, 50, 2))
+        self.aeb_fail_info = 0 if raw_aeb_fail == 0x3 else raw_aeb_fail
     elif address == ADDR_EMS12 and len(data) >= 2:
       raw_coolant = int(extract_intel(data, 8, 8))
       if raw_coolant not in (0xFE, 0xFF):
@@ -507,6 +587,9 @@ class IoniqCanState:
         self.fco_raw = raw_fco
     elif address == ADDR_EMS14 and len(data) >= 8:
       self.mil_lamp = bool(extract_intel(data, 1, 1))
+      raw_ems14_fco = int(extract_intel(data, 8, 16))
+      if raw_ems14_fco != 0xFFFF:
+        self.ems14_fco_raw = raw_ems14_fco
       raw_vb = int(extract_intel(data, 24, 8))
       if raw_vb not in (0, 0xFF):
         self.vb_ems_v = float(raw_vb * 0.1015625)
@@ -538,6 +621,8 @@ class IoniqCanState:
       if raw_dte not in (0x3FE, 0x3FF):
         self.dte_km = raw_dte
       self.active_eco_switch = bool(extract_intel(data, 39, 1))
+      if len(data) >= 8:
+        self.alt_lamp_status = bool(extract_intel(data, 59, 1))
     elif address == ADDR_CLU15 and len(data) >= 1:
       self.cluster_speed_kph = float(extract_intel(data, 0, 8))
     elif address == ADDR_WHL_SPD11 and len(data) >= 8:
@@ -622,6 +707,73 @@ class IoniqCanState:
     elif address == ADDR_ENG_FRZ_11 and len(data) >= 5:
       self.freeze_frame_load_pct = float(extract_intel(data, 0, 8, scale=100.0 / 255.0))
       self.freeze_frame_rpm = float(extract_intel(data, 16, 16, scale=0.25))
+    elif address == ADDR_EMS19 and len(data) >= 5:
+      raw_oil = int(extract_intel(data, 32, 8))
+      if raw_oil not in (0xFE, 0xFF):
+        self.eng_oil_temp_c = float(raw_oil * 0.75 - 40.0)
+      if len(data) >= 6:
+        self.bat_lamp_stat = bool(extract_intel(data, 42, 1))
+      if len(data) >= 8:
+        self.ops_fail = bool(extract_intel(data, 56, 1))
+    elif address == ADDR_MDPS12 and len(data) >= 2:
+      self.mdps_def = bool(extract_intel(data, 11, 1))
+      self.mdps_fail_stat = bool(extract_intel(data, 15, 1))
+      if len(data) >= 5:
+        self.mdps_serr = bool(extract_intel(data, 37, 1))
+    elif address == ADDR_LFAHDA_MFC and len(data) >= 3:
+      raw_lfa_warn = int(extract_intel(data, 16, 3))
+      self.lfa_sys_warning = 0 if raw_lfa_warn == 0x7 else raw_lfa_warn
+    elif address == ADDR_EPB11 and len(data) >= 1:
+      raw_epb_lamp = int(extract_intel(data, 4, 2))
+      self.epb_f_lamp = 0 if raw_epb_lamp == 0x3 else raw_epb_lamp
+      if len(data) >= 4:
+        raw_epb_fail = int(extract_intel(data, 29, 3))
+        self.epb_fail = 0 if raw_epb_fail == 0x7 else raw_epb_fail
+    elif address == ADDR_TPMS11 and len(data) >= 1:
+      raw_tpms = int(extract_intel(data, 0, 2))
+      raw_tread = int(extract_intel(data, 2, 2))
+      self.tpms_w_lamp = 0 if raw_tpms == 0x3 else raw_tpms
+      self.tread_w_lamp = 0 if raw_tread == 0x3 else raw_tread
+      self.tpms_pos_warn = (
+        bool(extract_intel(data, 4, 1)),
+        bool(extract_intel(data, 5, 1)),
+        bool(extract_intel(data, 6, 1)),
+        bool(extract_intel(data, 7, 1)),
+      )
+    elif address == ADDR_ACU11 and len(data) >= 5:
+      raw_acu_flt = int(extract_intel(data, 34, 2))
+      self.acu_flt_stat = 0 if raw_acu_flt == 0x3 else raw_acu_flt
+      if len(data) >= 7:
+        raw_acu_dtc = int(extract_intel(data, 40, 16))
+        self.acu_dtc_raw = 0 if raw_acu_dtc == 0xFFFF else raw_acu_dtc
+      if len(data) >= 8:
+        raw_acu_num = int(extract_intel(data, 56, 8))
+        self.acu_num_flt = 0 if raw_acu_num == 0xFF else raw_acu_num
+
+  def live_ecu_matrix(self, now_mono_s: float, *, stale_s: float = 5.0) -> list[dict]:
+    """Return live C-CAN presence matrix for all known Ioniq ECUs (zero TX required)."""
+    matrix: list[dict] = []
+    for ecu_id, name, addrs in LIVE_ECU_CHANNELS:
+      latest_ts: float | None = None
+      latest_bus: int | None = None
+      frames_seen = 0
+      for addr in addrs:
+        frames_seen += self.address_counts.get(addr, 0)
+        ts = self.seen_addresses.get(addr)
+        if ts is not None and (latest_ts is None or ts > latest_ts):
+          latest_ts = ts
+          latest_bus = self.seen_address_bus.get(addr)
+      ago = None if latest_ts is None else round(max(0.0, now_mono_s - latest_ts), 2)
+      online = bool(latest_ts is not None and (now_mono_s - latest_ts) <= stale_s)
+      matrix.append({
+        'ecuId': ecu_id,
+        'name': name,
+        'online': online,
+        'bus': latest_bus,
+        'lastSeenAgoS': ago,
+        'framesSeen': frames_seen,
+      })
+    return matrix
 
   def summary(self) -> dict:
     bat_health = self.battery_12v_health()
@@ -644,6 +796,7 @@ class IoniqCanState:
       'wheelAccelMps2': None if self.wheel_accel_mps2 is None else round(self.wheel_accel_mps2, 2),
       'instantFuelRateLph': round(self.instant_fuel_rate_lph, 2),
       'coolantTempC': thermal['coolantTempC'],
+      'engOilTempC': None if self.eng_oil_temp_c is None else round(self.eng_oil_temp_c, 1),
       'intakeAirTempC': thermal['intakeAirTempC'],
       'fuelTempC': thermal['fuelTempC'],
       'ambientTempC': thermal['ambientTempC'],
@@ -656,7 +809,11 @@ class IoniqCanState:
       'clusterAvgFc': self.cluster_avg_fc_value,
       'clusterAvgFcValue': self.cluster_avg_fc_value,
       'clusterAvgFcUnit': self.cluster_avg_fc_unit,
+      'clusterAvgFcL100': self.cluster_avg_l_per_100km(),
       'clusterAvgFcUnitLabel': unit_label,
+      'ems14FcoRaw': self.ems14_fco_raw,
+      'ems20FcoRaw': self.fco_raw,
+      'rawFuelFrames': dict(self.raw_fuel_frames),
       'bat12vVoltageV': bat_health['voltageV'],
       'bat12vSocPct': self.bat_12v_soc_pct,
       'bat12vSohPct': self.bat_12v_soh_pct,

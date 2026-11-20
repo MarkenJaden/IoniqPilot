@@ -230,21 +230,58 @@ def _parse_obd_mode01_readiness(payload: bytes) -> dict | None:
   }
 
 
+def _decode_supported_pids(base_pid: int, payload: bytes) -> set[int]:
+  if len(payload) < 6 or payload[0] != 0x41 or payload[1] != base_pid:
+    return set()
+  mask = (payload[2] << 24) | (payload[3] << 16) | (payload[4] << 8) | payload[5]
+  return {base_pid + offset for offset in range(1, 33) if (mask & (1 << (32 - offset)))}
+
+
 def _query_obd_live_and_freeze_frame(
   can_send: Callable[[list[Any]], Any],
   can_recv: Callable[..., list[Any]],
   *,
   bus: int = 1,
+  deadline: float | None = None,
+  query_freeze_frame: bool = True,
   clock: Callable[[], float] = time.monotonic,
-) -> tuple[dict | None, dict, dict | None]:
-  """Query OBD-II Mode 01 readiness/live PIDs and Mode 02 freeze-frame from ECM (0x7E0/0x7E8)."""
+) -> tuple[dict | None, dict, dict | None, list[str]]:
+  """Query OBD-II Mode 01 supported PIDs, readiness/live PIDs and Mode 02 freeze-frame from ECM (0x7E0/0x7E8)."""
   readiness: dict | None = None
   live: dict[str, Any] = {}
   freeze: dict[str, Any] = {}
+  supported_set: set[int] = set()
+
+  def _to(default_s: float) -> float:
+    if deadline is None:
+      return default_s
+    rem = deadline - clock()
+    return 0.0 if rem <= 0.02 else min(default_s, rem)
+
+  # Probe Mode 01 supported PID bitmasks (0x00, 0x20, 0x40) with short timeout to skip unsupported PIDs
+  for mask_pid in (0x00, 0x20, 0x40):
+    if mask_pid > 0x00 and mask_pid not in supported_set:
+      break
+    to = _to(0.12)
+    if to <= 0.0:
+      break
+    m_resp = isotp_exchange_many(can_send, can_recv, [(0x7E0, 0x7E8, bytes([0x01, mask_pid]))], bus=bus, timeout_s=to, clock=clock)
+    mp = m_resp.get(0x7E8)
+    if mp:
+      supported_set.update(_decode_supported_pids(mask_pid, mp))
+    elif mask_pid == 0x00:
+      break
+
+  obd_supported_pids = [f'0x{pid:02X}' for pid in sorted(supported_set)]
 
   # Mode 01 PIDs: 01 (readiness), 05 (coolant), 0C (RPM), 0D (speed), 10 (MAF), 2F (fuel level), 42 (ECU V), 5E (fuel rate)
-  for pid in (0x01, 0x05, 0x0C, 0x0D, 0x10, 0x2F, 0x42, 0x5E):
-    resp = isotp_exchange_many(can_send, can_recv, [(0x7E0, 0x7E8, bytes([0x01, pid]))], bus=bus, timeout_s=0.18, clock=clock)
+  candidate_pids = (0x01, 0x05, 0x0C, 0x0D, 0x10, 0x2F, 0x42, 0x5E)
+  pids_to_query = tuple(p for p in candidate_pids if not supported_set or p in supported_set)
+  for pid in pids_to_query:
+    to = _to(0.18)
+    if to <= 0.0:
+      break
+    resp = isotp_exchange_many(can_send, can_recv, [(0x7E0, 0x7E8, bytes([0x01, pid]))], bus=bus, timeout_s=to, clock=clock)
     p = resp.get(0x7E8)
     if not p or len(p) < 3 or p[0] != 0x41 or p[1] != pid:
       continue
@@ -267,26 +304,31 @@ def _query_obd_live_and_freeze_frame(
     elif pid == 0x5E and len(p) >= 4:
       live['fuelRateLph'] = round(((p[2] << 8) | p[3]) * 0.05, 3)
 
-  # Mode 02 Freeze Frame frame 0x00: PID 02 (DTC that caused freeze frame), 04 (load), 05 (coolant), 0C (RPM), 0D (speed)
-  r02 = isotp_exchange_many(can_send, can_recv, [(0x7E0, 0x7E8, b'\x02\x02\x00')], bus=bus, timeout_s=0.18, clock=clock)
-  p02 = r02.get(0x7E8)
-  if p02 and len(p02) >= 5 and p02[0] == 0x42 and p02[1] == 0x02 and (p02[3] != 0 or p02[4] != 0):
-    freeze['dtcCode'] = decode_dtc_bytes(p02[3], p02[4])
-    for pid in (0x04, 0x05, 0x0C, 0x0D):
-      rf = isotp_exchange_many(can_send, can_recv, [(0x7E0, 0x7E8, bytes([0x02, pid, 0x00]))], bus=bus, timeout_s=0.15, clock=clock)
-      pf = rf.get(0x7E8)
-      if not pf or len(pf) < 4 or pf[0] != 0x42 or pf[1] != pid:
-        continue
-      if pid == 0x04:
-        freeze['engineLoadPct'] = round(pf[3] * 100.0 / 255.0, 1)
-      elif pid == 0x05:
-        freeze['coolantTempC'] = round(float(pf[3]) - 40.0, 1)
-      elif pid == 0x0C and len(pf) >= 5:
-        freeze['rpm'] = round(((pf[3] << 8) | pf[4]) / 4.0, 1)
-      elif pid == 0x0D:
-        freeze['speedKph'] = float(pf[3])
+  # Mode 02 Freeze Frame frame 0x00: only query if readiness reports DTCs or explicitly requested
+  has_readiness_dtcs = bool(readiness is not None and readiness.get('emissionDtcCount', 0) > 0)
+  if (has_readiness_dtcs or query_freeze_frame) and _to(0.18) > 0.0:
+    r02 = isotp_exchange_many(can_send, can_recv, [(0x7E0, 0x7E8, b'\x02\x02\x00')], bus=bus, timeout_s=_to(0.18), clock=clock)
+    p02 = r02.get(0x7E8)
+    if p02 and len(p02) >= 5 and p02[0] == 0x42 and p02[1] == 0x02 and (p02[3] != 0 or p02[4] != 0):
+      freeze['dtcCode'] = decode_dtc_bytes(p02[3], p02[4])
+      for pid in (0x04, 0x05, 0x0C, 0x0D):
+        to = _to(0.15)
+        if to <= 0.0:
+          break
+        rf = isotp_exchange_many(can_send, can_recv, [(0x7E0, 0x7E8, bytes([0x02, pid, 0x00]))], bus=bus, timeout_s=to, clock=clock)
+        pf = rf.get(0x7E8)
+        if not pf or len(pf) < 4 or pf[0] != 0x42 or pf[1] != pid:
+          continue
+        if pid == 0x04:
+          freeze['engineLoadPct'] = round(pf[3] * 100.0 / 255.0, 1)
+        elif pid == 0x05:
+          freeze['coolantTempC'] = round(float(pf[3]) - 40.0, 1)
+        elif pid == 0x0C and len(pf) >= 5:
+          freeze['rpm'] = round(((pf[3] << 8) | pf[4]) / 4.0, 1)
+        elif pid == 0x0D:
+          freeze['speedKph'] = float(pf[3])
 
-  return readiness, live, (freeze or None)
+  return readiness, live, (freeze or None), obd_supported_pids
 
 
 def scan_ioniq_ecus(
@@ -294,6 +336,9 @@ def scan_ioniq_ecus(
   can_recv: Callable[..., list[Any]],
   *,
   bus: int = 1,
+  fallback_bus: int | None = None,
+  set_obd_multiplexing: Callable[[bool], Any] | None = None,
+  total_budget_s: float | None = None,
   ecus: tuple[EcuTarget, ...] = IONIQ_ECUS,
   read_identities: bool = True,
   timeout_s: float = 0.55,
@@ -301,44 +346,121 @@ def scan_ioniq_ecus(
 ) -> dict:
   """Scan all Ioniq AE HEV ECUs for UDS/OBD-II DTCs, freeze-frames, readiness, and ECU metadata."""
   started_at = _utc_timestamp()
+  t0 = clock()
+  budget_deadline = (t0 + total_budget_s) if total_budget_s is not None else None
+
+  def _remaining(default_to: float) -> float:
+    if budget_deadline is None:
+      return default_to
+    rem = budget_deadline - clock()
+    return 0.0 if rem <= 0.02 else min(default_to, rem)
+
   ecu_statuses: list[dict] = []
   dtcs: list[dict] = []
   seen_dtc_keys: set[tuple[str, str, str]] = set()
   vin: str | None = None
-
-  uds_requests = [(ecu.tx_addr, ecu.rx_addr, b'\x19\x02\xFF') for ecu in ecus if ecu.uds_supported]
-  uds_resps = isotp_exchange_many(can_send, can_recv, uds_requests, bus=bus, timeout_s=timeout_s, clock=clock)
-
+  uds_resps: dict[int, bytes] = {}
+  ecu_bus: dict[int, int] = {}
   ident_resps: dict[int, bytes] = {}
   sw_resps: dict[int, bytes] = {}
-  if read_identities and uds_resps:
-    responding_ecus = [ECU_BY_RX[rx] for rx in uds_resps if rx in ECU_BY_RX]
-    part_reqs = [(ecu.tx_addr, ecu.rx_addr, b'\x22\xF1\x87') for ecu in responding_ecus]
-    sw_reqs = [(ecu.tx_addr, ecu.rx_addr, b'\x22\xF1\x95') for ecu in responding_ecus]
-    ident_resps = isotp_exchange_many(can_send, can_recv, part_reqs, bus=bus, timeout_s=0.35, clock=clock)
-    sw_resps = isotp_exchange_many(can_send, can_recv, sw_reqs, bus=bus, timeout_s=0.35, clock=clock)
-    if 0x7E8 in uds_resps:
-      vin_resp = isotp_exchange_many(can_send, can_recv, [(0x7E0, 0x7E8, b'\x22\xF1\x90')], bus=bus, timeout_s=0.35, clock=clock)
-      if 0x7E8 in vin_resp:
-        vin = _decode_ascii_did(vin_resp[0x7E8], 0xF1, 0x90)
-
-  # Fallback OBD-II Modes 03 (confirmed), 07 (pending), 0A (permanent) on powertrain ECUs if needed
-  obd_ecus = [ecu for ecu in ecus if ecu.obd_supported and ecu.tx_addr in (0x7E0, 0x7E1, 0x7E2, 0x7E4)]
-  obd_by_rx: dict[int, list[dict]] = {ecu.rx_addr: [] for ecu in obd_ecus}
-  for mode in (0x03, 0x07, 0x0A):
-    reqs = [(ecu.tx_addr, ecu.rx_addr, bytes([mode])) for ecu in obd_ecus]
-    resps = isotp_exchange_many(can_send, can_recv, reqs, bus=bus, timeout_s=0.35, clock=clock)
-    for rx, payload in resps.items():
-      ecu = ECU_BY_RX.get(rx)
-      if ecu is not None:
-        obd_by_rx[rx].extend(parse_obd_dtc_response(payload, ecu, mode))
-
-  # Query OBD-II Mode 01 readiness + live PIDs and Mode 02 freeze-frame if ECM responded
+  obd_by_rx: dict[int, list[dict]] = {ecu.rx_addr: [] for ecu in ecus if ecu.obd_supported}
+  obd_responded_rx: set[int] = set()
+  uds_snapshots: dict[tuple[str, str, str], str] = {}
   readiness: dict | None = None
   obd_live: dict[str, Any] = {}
   obd_freeze: dict | None = None
-  if 0x7E8 in uds_resps or obd_by_rx.get(0x7E8):
-    readiness, obd_live, obd_freeze = _query_obd_live_and_freeze_frame(can_send, can_recv, bus=bus, clock=clock)
+  obd_supported_pids: list[str] = []
+
+  def _scan_bus_phase(target_ecus: list[EcuTarget], target_bus: int, phase_timeout: float) -> None:
+    nonlocal vin, readiness, obd_live, obd_freeze, obd_supported_pids
+    if not target_ecus:
+      return
+    to = _remaining(phase_timeout)
+    if to <= 0.0:
+      return
+    uds_requests = [(ecu.tx_addr, ecu.rx_addr, b'\x19\x02\xFF') for ecu in target_ecus if ecu.uds_supported]
+    phase_uds = isotp_exchange_many(can_send, can_recv, uds_requests, bus=target_bus, timeout_s=to, clock=clock)
+    for rx, payload in phase_uds.items():
+      uds_resps[rx] = payload
+      ecu_bus[rx] = target_bus
+
+    # OBD-II Modes 03/07/0A on unqueried powertrain ECUs for this bus
+    phase_obd_ecus = [
+      ecu for ecu in target_ecus
+      if ecu.obd_supported and ecu.tx_addr in (0x7E0, 0x7E1, 0x7E2, 0x7E4) and ecu.rx_addr not in obd_responded_rx
+    ]
+    if phase_obd_ecus:
+      for mode in (0x03, 0x07, 0x0A):
+        obd_to = _remaining(0.35 if total_budget_s is None else 0.22)
+        if obd_to <= 0.0:
+          break
+        reqs = [(ecu.tx_addr, ecu.rx_addr, bytes([mode])) for ecu in phase_obd_ecus]
+        resps = isotp_exchange_many(can_send, can_recv, reqs, bus=target_bus, timeout_s=obd_to, clock=clock)
+        for rx, payload in resps.items():
+          ecu = ECU_BY_RX.get(rx)
+          if ecu is not None:
+            obd_responded_rx.add(rx)
+            ecu_bus.setdefault(rx, target_bus)
+            obd_by_rx[rx].extend(parse_obd_dtc_response(payload, ecu, mode))
+
+    # Query OBD-II Mode 01/02 if ECM (0x7E8) responded on this bus and not yet queried
+    if (0x7E8 in phase_uds or 0x7E8 in obd_responded_rx) and readiness is None and not obd_live:
+      has_ecm_dtcs = bool(obd_by_rx.get(0x7E8)) or (0x7E8 in phase_uds and len(phase_uds[0x7E8]) > 3)
+      readiness, obd_live, obd_freeze, obd_supported_pids = _query_obd_live_and_freeze_frame(
+        can_send,
+        can_recv,
+        bus=target_bus,
+        deadline=budget_deadline,
+        query_freeze_frame=has_ecm_dtcs or total_budget_s is None,
+        clock=clock,
+      )
+
+    if read_identities and phase_uds:
+      responding_ecus = [ECU_BY_RX[rx] for rx in phase_uds if rx in ECU_BY_RX]
+      id_to = _remaining(0.35)
+      if id_to > 0.0:
+        part_reqs = [(ecu.tx_addr, ecu.rx_addr, b'\x22\xF1\x87') for ecu in responding_ecus]
+        ident_resps.update(isotp_exchange_many(can_send, can_recv, part_reqs, bus=target_bus, timeout_s=id_to, clock=clock))
+      sw_to = _remaining(0.35)
+      if sw_to > 0.0:
+        sw_reqs = [(ecu.tx_addr, ecu.rx_addr, b'\x22\xF1\x95') for ecu in responding_ecus]
+        sw_resps.update(isotp_exchange_many(can_send, can_recv, sw_reqs, bus=target_bus, timeout_s=sw_to, clock=clock))
+      if 0x7E8 in phase_uds and vin is None:
+        vin_to = _remaining(0.35)
+        if vin_to > 0.0:
+          vin_resp = isotp_exchange_many(can_send, can_recv, [(0x7E0, 0x7E8, b'\x22\xF1\x90')], bus=target_bus, timeout_s=vin_to, clock=clock)
+          if 0x7E8 in vin_resp:
+            vin = _decode_ascii_did(vin_resp[0x7E8], 0xF1, 0x90)
+
+    # Fetch UDS 0x19 0x04 snapshots while this bus is active
+    for rx, payload in phase_uds.items():
+      ecu = ECU_BY_RX.get(rx)
+      if ecu is None:
+        continue
+      parsed_dtcs, _ = parse_uds_dtc_response(payload, ecu)
+      for rec in parsed_dtcs:
+        dtc_bytes = rec.get('_dtcBytes')
+        if dtc_bytes is None:
+          continue
+        snap_to = _remaining(0.18)
+        if snap_to <= 0.0:
+          break
+        b0, b1, ftb = dtc_bytes
+        snap_req = [(ecu.tx_addr, ecu.rx_addr, bytes([0x19, 0x04, b0, b1, ftb, 0xFF]))]
+        snap_resp = isotp_exchange_many(can_send, can_recv, snap_req, bus=target_bus, timeout_s=snap_to, clock=clock)
+        sp = snap_resp.get(ecu.rx_addr)
+        if sp and len(sp) > 6 and sp[0] == 0x59 and sp[1] == 0x04:
+          uds_snapshots[(rec['ecuId'], rec['code'].split('-', 1)[0], rec['source'])] = sp[6:].hex()
+
+  # Phase 1: primary bus (typically bus=1 OBD-II)
+  _scan_bus_phase(list(ecus), bus, timeout_s)
+
+  # Phase 2: fallback bus (typically bus=0 C-CAN) for non-responding ECUs (e.g. MFC/SCC/MDPS)
+  missing_ecus = [ecu for ecu in ecus if ecu.rx_addr not in uds_resps and ecu.rx_addr not in obd_responded_rx]
+  if fallback_bus is not None and fallback_bus != bus and missing_ecus and _remaining(timeout_s) > 0.02:
+    if set_obd_multiplexing is not None:
+      set_obd_multiplexing(False)
+    _scan_bus_phase(missing_ecus, fallback_bus, min(timeout_s, 0.35))
 
   for ecu in ecus:
     payload = uds_resps.get(ecu.rx_addr)
@@ -351,15 +473,9 @@ def scan_ioniq_ecus(
       dedup_key = (rec['ecuId'], rec['code'].split('-', 1)[0], rec['source'])
       if dedup_key not in seen_dtc_keys:
         seen_dtc_keys.add(dedup_key)
-        dtc_bytes = rec.pop('_dtcBytes', None)
-        # Try UDS 0x19 0x04 DTCSnapshotRecordByDTCNumber for discovered UDS DTCs
-        if dtc_bytes is not None and rec['source'] == 'uds_19_02':
-          b0, b1, ftb = dtc_bytes
-          snap_req = [(ecu.tx_addr, ecu.rx_addr, bytes([0x19, 0x04, b0, b1, ftb, 0xFF]))]
-          snap_resp = isotp_exchange_many(can_send, can_recv, snap_req, bus=bus, timeout_s=0.18, clock=clock)
-          sp = snap_resp.get(ecu.rx_addr)
-          if sp and len(sp) > 6 and sp[0] == 0x59 and sp[1] == 0x04:
-            rec['snapshotHex'] = sp[6:].hex()
+        rec.pop('_dtcBytes', None)
+        if dedup_key in uds_snapshots:
+          rec['snapshotHex'] = uds_snapshots[dedup_key]
         if obd_freeze and obd_freeze.get('dtcCode') == rec['code'].split('-', 1)[0]:
           rec['freezeFrame'] = dict(obd_freeze)
         dtcs.append(rec)
@@ -373,6 +489,7 @@ def scan_ioniq_ecus(
       'txHex': f'0x{ecu.tx_addr:03X}',
       'rxHex': f'0x{ecu.rx_addr:03X}',
       'online': responded,
+      'busUsed': ecu_bus.get(ecu.rx_addr),
       'dtcCount': len(ecu_codes),
       'activeCount': sum(1 for d in ecu_codes if d['active']),
       'nrc': nrc,
@@ -384,7 +501,7 @@ def scan_ioniq_ecus(
   analysis = analyze_dtcs(dtcs)
   return {
     'scannedAt': started_at,
-    'transport': 'isotp_elm327',
+    'transport': 'isotp_elm327_dual_bus' if fallback_bus is not None else 'isotp_elm327',
     'vin': vin,
     'ecusResponded': sum(1 for item in ecu_statuses if item['online']),
     'ecusTotal': len(ecu_statuses),
@@ -392,7 +509,9 @@ def scan_ioniq_ecus(
     'dtcs': dtcs,
     'readiness': readiness,
     'obdLive': obd_live,
+    'obdSupportedPids': obd_supported_pids,
     'freezeFrame': obd_freeze,
+    'durationMs': round(max(0.0, (clock() - t0) * 1000.0), 1),
     'analysis': analysis,
   }
 
@@ -403,11 +522,14 @@ def clear_ioniq_dtcs(
   *,
   target_ecu: str = 'ALL',
   bus: int = 1,
+  fallback_bus: int | None = None,
+  set_obd_multiplexing: Callable[[bool], Any] | None = None,
   clock: Callable[[], float] = time.monotonic,
 ) -> dict:
   """Clear stored DTCs via UDS 0x14 FF FF FF (and OBD Mode 04 for ALL/powertrain)."""
   cleared: list[dict] = []
   errors: list[str] = []
+  responded_rx: set[int] = set()
 
   if target_ecu.upper() == 'ALL':
     targets = list(IONIQ_ECUS)
@@ -417,29 +539,40 @@ def clear_ioniq_dtcs(
       raise ValueError(f'Unknown ECU target: {target_ecu}')
     targets = [ecu]
 
-  # UDS ClearDiagnosticInformation (0x14 0xFF 0xFF 0xFF)
-  reqs = [(ecu.tx_addr, ecu.rx_addr, b'\x14\xFF\xFF\xFF') for ecu in targets]
-  resps = isotp_exchange_many(can_send, can_recv, reqs, bus=bus, timeout_s=0.7, clock=clock)
-  for ecu in targets:
-    payload = resps.get(ecu.rx_addr)
-    if payload is None:
-      continue
-    if payload[:1] == b'\x54':
-      cleared.append({'ecuId': ecu.ecu_id, 'status': 'cleared_uds'})
-    elif len(payload) >= 3 and payload[0] == 0x7F and payload[1] == 0x14:
-      errors.append(f'{ecu.ecu_id}: UDS NRC 0x{payload[2]:02X}')
+  def _clear_on_bus(bus_targets: list[EcuTarget], target_bus: int) -> None:
+    if not bus_targets:
+      return
+    reqs = [(ecu.tx_addr, ecu.rx_addr, b'\x14\xFF\xFF\xFF') for ecu in bus_targets]
+    resps = isotp_exchange_many(can_send, can_recv, reqs, bus=target_bus, timeout_s=0.7, clock=clock)
+    for ecu in bus_targets:
+      payload = resps.get(ecu.rx_addr)
+      if payload is None:
+        continue
+      responded_rx.add(ecu.rx_addr)
+      if payload[:1] == b'\x54':
+        cleared.append({'ecuId': ecu.ecu_id, 'status': 'cleared_uds', 'bus': target_bus})
+      elif len(payload) >= 3 and payload[0] == 0x7F and payload[1] == 0x14:
+        errors.append(f'{ecu.ecu_id}: UDS NRC 0x{payload[2]:02X}')
 
-  # Functional OBD-II Mode 04 if ALL or powertrain requested
-  if target_ecu.upper() in ('ALL', 'ECM', 'TCU', 'HCU', 'BMS'):
-    obd_targets = [ecu for ecu in targets if ecu.tx_addr in (0x7E0, 0x7E1, 0x7E2, 0x7E4)]
-    obd_resps = isotp_exchange_many(
-      can_send, can_recv, [(ecu.tx_addr, ecu.rx_addr, b'\x04') for ecu in obd_targets],
-      bus=bus, timeout_s=0.6, clock=clock,
-    )
-    for ecu in obd_targets:
-      if obd_resps.get(ecu.rx_addr, b'')[:1] == b'\x44':
-        if not any(item['ecuId'] == ecu.ecu_id for item in cleared):
-          cleared.append({'ecuId': ecu.ecu_id, 'status': 'cleared_obd04'})
+    if target_ecu.upper() in ('ALL', 'ECM', 'TCU', 'HCU', 'BMS'):
+      obd_targets = [ecu for ecu in bus_targets if ecu.tx_addr in (0x7E0, 0x7E1, 0x7E2, 0x7E4)]
+      if obd_targets:
+        obd_resps = isotp_exchange_many(
+          can_send, can_recv, [(ecu.tx_addr, ecu.rx_addr, b'\x04') for ecu in obd_targets],
+          bus=target_bus, timeout_s=0.6, clock=clock,
+        )
+        for ecu in obd_targets:
+          if obd_resps.get(ecu.rx_addr, b'')[:1] == b'\x44':
+            responded_rx.add(ecu.rx_addr)
+            if not any(item['ecuId'] == ecu.ecu_id for item in cleared):
+              cleared.append({'ecuId': ecu.ecu_id, 'status': 'cleared_obd04', 'bus': target_bus})
+
+  _clear_on_bus(targets, bus)
+  remaining_targets = [ecu for ecu in targets if ecu.rx_addr not in responded_rx]
+  if fallback_bus is not None and fallback_bus != bus and remaining_targets:
+    if set_obd_multiplexing is not None:
+      set_obd_multiplexing(False)
+    _clear_on_bus(remaining_targets, fallback_bus)
 
   return {
     'clearedAt': _utc_timestamp(),
@@ -519,6 +652,39 @@ class PassiveEcuMonitor:
     if low_12v or self._last_low_12v_seen and (can_state.bat_12v_voltage_v is not None and can_state.bat_12v_voltage_v < 11.9):
       detected['BAT_12V_LOW'] = ('IBS', 'warning', f'12V-Batteriespannung niedrig ({can_state.bat_12v_voltage_v:.2f}V)')
     self._last_low_12v_seen = low_12v
+    if can_state.mdps_def or can_state.mdps_fail_stat or can_state.mdps_serr:
+      detected['MDPS_FAULT'] = ('MDPS', 'critical', 'Servolenkung (MDPS) Störung aktiv (MDPS12)')
+    if can_state.tcs13_acc_enable in (1, 2, 3) or can_state.scc_fail_info in (1, 2):
+      detected['SCC_FAULT'] = (
+        'SCC',
+        'warning',
+        f'Tempomat/Radar-Störung (ACCEnable={can_state.tcs13_acc_enable}, Fail={can_state.scc_fail_info})',
+      )
+    if can_state.aeb_fail_info in (1, 2):
+      detected['AEB_FAULT'] = ('SCC', 'warning', f'Notbremsassistent (AEB) Störung (AEB_Failinfo={can_state.aeb_fail_info})')
+    if can_state.lfa_sys_warning in (3, 4):
+      detected['LKAS_FAULT'] = ('MFC', 'warning', f'Spurhalteassistent (LKAS/LFA) Warnung (Warn={can_state.lfa_sys_warning})')
+    if can_state.epb_f_lamp in (1, 2) or can_state.epb_fail > 0:
+      detected['EPB_FAULT'] = (
+        'ESC',
+        'warning',
+        f'Elektrische Parkbremse (EPB) Fehler/Warnung (Lamp={can_state.epb_f_lamp}, Fail={can_state.epb_fail})',
+      )
+    if can_state.tpms_w_lamp in (1, 2) or can_state.tread_w_lamp in (1, 2):
+      wheels = ', '.join(lbl for lbl, flag in zip(('VL', 'VR', 'HL', 'HR'), can_state.tpms_pos_warn, strict=True) if flag)
+      suffix = f': {wheels}' if wheels else ''
+      detected['TPMS_WARN'] = ('BCM', 'warning', f'Reifendruck-Warnung (TPMS{suffix})')
+    if can_state.acu_flt_stat in (1, 2) or can_state.acu_num_flt > 0:
+      dtc_part = f', DTC=0x{can_state.acu_dtc_raw:04X}' if can_state.acu_dtc_raw > 0 else ''
+      detected['ACU_AIRBAG'] = ('ACU', 'critical', f'Airbag-System (ACU) Störung (Fehler={can_state.acu_num_flt}{dtc_part})')
+    if can_state.ops_fail and (mono_s is None or can_state.engine_is_firing()):
+      detected['EMS_OIL_PRESSURE'] = ('ECM', 'critical', 'Öldruck-Störung bei laufendem Motor (EMS19.CF_Ems_OPSFail)')
+    if (can_state.bat_lamp_stat or can_state.alt_lamp_status) and (
+      mono_s is None or can_state.engine_is_firing() or can_state.best_speed_kph() > 5.0
+    ):
+      detected['EMS_ALT_LAMP'] = ('ECM', 'warning', 'Ladekontrollleuchte / 12V-Generatormeldung aktiv (EMS19/CLU13)')
+    if can_state.coolant_temp_c is not None and can_state.coolant_temp_c > 105.0:
+      detected['COOLANT_OVERHEAT'] = ('ECM', 'critical', f'Kühlmittel überhitzt ({can_state.coolant_temp_c:.1f} °C > 105 °C)')
 
     # Clear resolved warnings and candidate counters
     for code in list(self._candidate_since):
@@ -573,6 +739,7 @@ def read_diagnostics_state(root: Path | str | None = None) -> dict:
     'pendingAction': None,   # {'type': 'scan'|'clear', 'target': 'ALL', 'requestedAt': ...}
     'passive': {'activeWarnings': [], 'warningHistory': []},
     'liveSummary': {},
+    'liveEcus': [],
     'history': [],
   }
   data = read_json(diagnostics_path(root), default)

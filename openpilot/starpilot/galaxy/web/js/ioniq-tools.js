@@ -37,6 +37,18 @@ export function saveCsvDownload(filename, csvText) {
   setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
+export function saveJsonDownload(filename, jsonText) {
+  const blob = new Blob([jsonText || "{}"], { type: "application/json;charset=utf-8" })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement("a")
+  a.href = url
+  a.download = filename || "ioniq-discovery.json"
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+
 export const IoniqToolsPage = {
   props: {
     mode: String,
@@ -66,6 +78,10 @@ export const IoniqToolsPage = {
         refuelNotes: "",
         manualTripLabel: "",
         clearTarget: "ALL",
+        discoveryLabel: "Verbrauchsanalyse",
+        discoveryDashL100: "",
+        discoveryDashKm: "",
+        discoveryNotes: "",
       }),
       controller: null,
       timer: null,
@@ -102,12 +118,13 @@ export const IoniqToolsPage = {
     pollIntervalMs() {
       const learnState = this.state.data?.buttons?.learnStatus?.state
       if (learnState === "sampling_baseline" || learnState === "listening") return 450
-      if (this.state.data?.recordings?.continuousActive) return 1500
+      if (this.state.data?.recordings?.continuousActive || this.state.data?.discovery?.active) return 1500
       return 3000
     },
     diagnostics() { return this.state.data?.diagnostics || {} },
     lastScan() { return this.diagnostics.lastScan || null },
     liveSummary() { return this.diagnostics.liveSummary || {} },
+    liveEcus() { return this.diagnostics.liveEcus || [] },
     battery12v() { return this.liveSummary.battery12vHealth || {} },
     thermal() { return this.liveSummary.thermalStatus || {} },
     passiveWarnings() { return this.diagnostics.passive?.activeWarnings || [] },
@@ -116,6 +133,7 @@ export const IoniqToolsPage = {
     currentTank() { return this.fuel.currentTank || {} },
     activeTrip() { return this.fuel.activeTrip || null },
     sourceDiag() { return this.fuel.sourceDiagnostics || this.activeTrip?.sourceDiagnostics || {} },
+    discovery() { return this.state.data?.discovery || { active: false, captures: [] } },
     learnStatus() { return this.state.data?.buttons?.learnStatus || { state: "idle", detectedPresses: 0, targetPresses: 3 } },
     bindings() { return this.state.data?.buttons?.bindings || [] },
     recordingsList() { return this.state.data?.recordings?.recordings || [] },
@@ -127,11 +145,18 @@ export const IoniqToolsPage = {
     sourceLabel(mode) {
       return {
         fco_can: "CAN Einspritzung",
+        fco_ems14: "CAN Einspritzung (0x545)",
         obd_pid: "OBD-II Live",
         torque_model: "Kennfeld-Modell",
         hev_model: "HEV C-CAN Modell",
         cluster_avg_fci: "Tacho-Referenz",
       }[mode] || mode || "Bereit"
+    },
+    rawHex(addr) {
+      return (this.sourceDiag?.rawFuelFrames || this.liveSummary?.rawFuelFrames || {})[addr] || "—"
+    },
+    liveEcuFaultCount(ecuId) {
+      return this.passiveWarnings.filter((w) => w.ecuId === ecuId).length
     },
     evSplitPct(evKm, iceKm, fallbackTimePct = 0) {
       const total = (Number(evKm) || 0) + (Number(iceKm) || 0)
@@ -276,6 +301,33 @@ export const IoniqToolsPage = {
       const res = await this.act("export_trips_csv", {})
       if (res?.csv) saveCsvDownload(res.filename, res.csv)
     },
+    async startDiscovery() {
+      const res = await this.act("start_can_discovery", {
+        label: this.state.discoveryLabel || "Verbrauchsanalyse",
+      })
+      if (res?.saved) {
+        this.state.notice = "CAN-Verbrauchsanalyse gestartet. Nach einigen Minuten auf „Stoppen & auswerten“ tippen."
+      }
+    },
+    async stopDiscovery() {
+      const l100Raw = parseFloat(String(this.state.discoveryDashL100 || "").replace(",", "."))
+      const kmRaw = parseFloat(String(this.state.discoveryDashKm || "").replace(",", "."))
+      const res = await this.act("stop_can_discovery", {
+        dashboardLPer100Km: !Number.isNaN(l100Raw) && l100Raw > 0 ? l100Raw : null,
+        dashboardDistanceKm: !Number.isNaN(kmRaw) && kmRaw > 0 ? kmRaw : null,
+        notes: this.state.discoveryNotes || "",
+      })
+      if (res?.saved) {
+        this.state.discoveryDashL100 = ""
+        this.state.discoveryDashKm = ""
+        this.state.discoveryNotes = ""
+        this.state.notice = "CAN-Analyse gespeichert und Top-Kandidaten berechnet."
+      }
+    },
+    async downloadDiscoveryJson(capId) {
+      const res = await this.act("export_can_discovery", { id: capId })
+      if (res?.json) saveJsonDownload(res.filename, res.json)
+    },
     async startLearn() {
       if (!this.state.learnLabel.trim()) return
       await this.act("start_learn", { label: this.state.learnLabel.trim(), buttonAction: this.state.learnAction })
@@ -368,8 +420,8 @@ export const IoniqToolsPage = {
               </div>
               <div class="gx-ioniq__kpi">
                 <span class="gx-ioniq__kpi-label">Tacho-Bordcomputer</span>
-                <strong class="gx-ioniq__kpi-val">{{ formatNum(liveSummary.clusterAvgFc ?? liveSummary.clusterAvgFcValue ?? activeTrip?.clusterAvgLPer100Km ?? activeTrip?.avgLPer100Km ?? currentTank.estimatedLPer100Km, 1) }}</strong>
-                <span class="gx-ioniq__kpi-sub">{{ liveSummary.clusterAvgFcUnitLabel || 'L/100km' }} ({{ (liveSummary.clusterAvgFc ?? liveSummary.clusterAvgFcValue) != null ? 'CLU13' : 'HEV-Modell' }})</span>
+                <strong class="gx-ioniq__kpi-val">{{ formatNum(liveSummary.clusterAvgFcL100 ?? liveSummary.clusterAvgFc ?? liveSummary.clusterAvgFcValue ?? activeTrip?.clusterAvgLPer100Km ?? activeTrip?.avgLPer100Km ?? currentTank.estimatedLPer100Km, 1) }}</strong>
+                <span class="gx-ioniq__kpi-sub">{{ liveSummary.clusterAvgFcUnitLabel || 'L/100km' }} ({{ (liveSummary.clusterAvgFcL100 ?? liveSummary.clusterAvgFc ?? liveSummary.clusterAvgFcValue) != null ? 'CLU13' : 'HEV-Modell' }})</span>
               </div>
               <div class="gx-ioniq__kpi">
                 <span class="gx-ioniq__kpi-label">Tank-Distanz</span>
@@ -439,12 +491,58 @@ export const IoniqToolsPage = {
               <div class="gx-ioniq__stats" style="margin-top: 10px">
                 <div class="gx-ioniq__stat"><span>Aktive Quelle</span><strong>{{ sourceDiag.activeSource || activeTrip?.sourceMode || 'Bereit' }}</strong></div>
                 <div class="gx-ioniq__stat"><span>FCO (EMS20)</span><strong>{{ sourceDiag.fcoValid ? formatNum(sourceDiag.fcoLiters, 3, ' L') : 'Inaktiv' }}</strong></div>
+                <div class="gx-ioniq__stat"><span>FCO (EMS14 0x545)</span><strong>{{ sourceDiag.ems14FcoValid ? formatNum(sourceDiag.ems14FcoLiters, 3, ' L') : (sourceDiag.ems14FcoSeen ? 'Prüfung' : 'Inaktiv') }}</strong></div>
                 <div class="gx-ioniq__stat"><span>HEV-Modell / Kennfeld</span><strong>{{ formatNum(sourceDiag.modelLiters, 3, ' L') }}</strong></div>
                 <div class="gx-ioniq__stat"><span>Momentanfluss</span><strong>{{ formatNum(sourceDiag.instantFuelRateLph ?? activeTrip?.instantFuelRateLph ?? liveSummary.instantFuelRateLph, 2, ' L/h') }}</strong></div>
                 <div class="gx-ioniq__stat"><span>Tacho-Fallback</span><strong>{{ formatNum(sourceDiag.clusterFallbackLiters, 3, ' L') }}</strong></div>
                 <div class="gx-ioniq__stat"><span>Motordrehzahl</span><strong>{{ formatNum(liveSummary.engineRpm, 0, ' U/min') }}</strong></div>
+                <div class="gx-ioniq__stat"><span>Roh-Hex (545/200/50C)</span><strong><code>{{ rawHex('0x545') }}</code> · <code>{{ rawHex('0x200') }}</code> · <code>{{ rawHex('0x50C') }}</code></strong></div>
               </div>
             </details>
+
+            <div class="gx-ioniq__card">
+              <div class="gx-ioniq__card-head">
+                <span class="gx-ioniq__card-title">CAN-Verbrauchsanalyse (Rohdaten-Mitschnitt)</span>
+                <span :class="discovery.active ? 'gx-ioniq__pill gx-ioniq__pill--ok' : 'gx-ioniq__pill'">
+                  {{ discovery.active ? ('Aktiv · ' + (discovery.sampleCount || 0) + 's · ' + (discovery.uniqueCanIds || 0) + ' IDs') : 'Bereit' }}
+                </span>
+              </div>
+              <p style="margin:0; font-size:.82rem; color:var(--on-surface-variant)">
+                Zeichnet Rohdaten während der Fahrt auf und rankt versteckte 16-Bit Kraftstoffzähler. Danach Tacho-Ø &amp; Distanz eingeben und JSON exportieren.
+              </p>
+              <template v-if="!discovery.active">
+                <div class="gx-actions">
+                  <input class="gx-field" v-model="state.discoveryLabel" maxlength="64" placeholder="Name des Mitschnitts">
+                  <button type="button" class="gx-btn" :disabled="state.busy" @click="startDiscovery()">Mitschnitt starten</button>
+                </div>
+              </template>
+              <template v-else>
+                <div class="gx-ioniq__form-grid">
+                  <label class="gx-field-group">Tacho-Ø (L/100km)<input class="gx-field" type="number" step="0.1" min="0.5" max="30" v-model="state.discoveryDashL100" placeholder="z.B. 4.8"></label>
+                  <label class="gx-field-group">Tacho-Distanz (km)<input class="gx-field" type="number" step="0.1" min="0.1" max="500" v-model="state.discoveryDashKm" placeholder="optional"></label>
+                  <label class="gx-field-group">Notiz<input class="gx-field" v-model="state.discoveryNotes" maxlength="160" placeholder="z.B. Stadt + Landstraße"></label>
+                </div>
+                <div class="gx-actions">
+                  <button type="button" class="gx-btn" :disabled="state.busy" @click="stopDiscovery()">Stoppen &amp; auswerten</button>
+                </div>
+              </template>
+              <div v-for="cap in (discovery.captures || [])" :key="cap.id" class="gx-ioniq__dtc-box">
+                <div class="gx-ioniq__card-head">
+                  <strong>{{ cap.label }}</strong>
+                  <span style="font-size:.78rem; color:var(--text-muted)">{{ formatTimestamp(cap.startedAt) }} · {{ formatDuration(cap.durationS) }} · {{ cap.sampleCount }} Samples · {{ cap.uniqueCanIds }} IDs</span>
+                </div>
+                <div v-if="cap.topCandidate" style="font-size:.8rem; margin-top:4px">
+                  Top-Kandidat: <code>{{ cap.topCandidate.addressHex }}</code> Byte {{ cap.topCandidate.byteOffset }} ({{ cap.topCandidate.endian }})
+                  <span v-if="cap.topCandidate.estimatedUlPerTick"> · ~{{ cap.topCandidate.estimatedUlPerTick }} µL/Tick</span>
+                </div>
+                <div v-else style="font-size:.8rem; color:var(--text-muted); margin-top:4px">Noch kein eindeutiger monotoner 16-Bit Zähler im Abschnitt gefunden.</div>
+                <div class="gx-actions" style="margin-top:6px">
+                  <button type="button" class="gx-btn gx-btn--tonal" :disabled="state.busy" @click="downloadDiscoveryJson(cap.id)">JSON laden</button>
+                  <button type="button" class="gx-btn gx-btn--tonal" :disabled="state.busy || !state.data.parked"
+                    @click="confirmAction('delete_can_discovery', 'Mitschnitt löschen?', 'CAN-Verbrauchsanalyse dauerhaft entfernen?', { id: cap.id })">Löschen</button>
+                </div>
+              </div>
+            </div>
 
             <h4>Letzte Einzelfahrten ({{ (fuel.trips || []).length }})</h4>
             <p v-if="!(fuel.trips || []).length">Noch keine abgeschlossenen Fahrten aufgezeichnet.</p>
@@ -502,10 +600,10 @@ export const IoniqToolsPage = {
               </div>
             </div>
 
-            <h4 v-if="(fuel.refuels || []).length">Erfasste Tankvorgänge ({{ (fuel.refuels || []).length }})</h4>
-            <div v-for="rf in (fuel.refuels || []).slice(0, 10)" :key="rf.id" class="gx-ioniq__card">
+            <h4 v-if="(fuel.refuelLog || []).length">Erfasste Tankvorgänge ({{ (fuel.refuelLog || []).length }})</h4>
+            <div v-for="rf in (fuel.refuelLog || []).slice(0, 10)" :key="rf.id" class="gx-ioniq__card">
               <div class="gx-ioniq__card-head">
-                <span class="gx-ioniq__card-title">{{ formatTimestamp(rf.timestamp) }}</span>
+                <span class="gx-ioniq__card-title">{{ formatTimestamp(rf.loggedAt) }}</span>
                 <span :class="rf.fullTank ? 'gx-ioniq__pill gx-ioniq__pill--ok' : 'gx-ioniq__pill'">{{ rf.fullTank ? 'Vollgetankt' : 'Teiltankung' }}</span>
               </div>
               <div class="gx-ioniq__stats">
@@ -566,6 +664,33 @@ export const IoniqToolsPage = {
               <p v-if="thermal.explanation" style="margin:0; font-size:.8rem; color:var(--on-surface-variant)">{{ thermal.explanation }}</p>
             </div>
 
+            <div class="gx-ioniq__card">
+              <div class="gx-ioniq__card-head">
+                <span class="gx-ioniq__card-title">Live-CAN Echtzeit-Monitor (während der Fahrt aktiv)</span>
+                <span class="gx-ioniq__pill gx-ioniq__pill--ok">Passiv · 0% Bus-Eingriff</span>
+              </div>
+              <p v-if="!liveEcus.length" style="margin:0; font-size:.82rem; color:var(--on-surface-variant)">
+                Warte auf C-CAN Frames der Steuergeräte…
+              </p>
+              <div v-else class="gx-ioniq__ecu-grid">
+                <div v-for="ecu in liveEcus" :key="ecu.ecuId" class="gx-ioniq__card" style="padding:10px 12px; gap:6px">
+                  <div class="gx-ioniq__card-head">
+                    <strong style="font-size:.85rem">{{ ecu.ecuId }} · {{ ecu.name }}</strong>
+                    <span :class="!ecu.online ? 'gx-ioniq__pill' : (liveEcuFaultCount(ecu.ecuId) > 0 ? 'gx-ioniq__pill gx-ioniq__pill--danger' : 'gx-ioniq__pill gx-ioniq__pill--ok')">
+                      {{ !ecu.online ? 'Warte' : (liveEcuFaultCount(ecu.ecuId) > 0 ? liveEcuFaultCount(ecu.ecuId) + ' Warnung' : 'Online') }}
+                    </span>
+                  </div>
+                  <div style="font-size:.72rem; color:var(--text-muted)">
+                    <code>{{ ecu.addressHex }}</code> · {{ ecu.frameCount || 0 }} Frames
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <h4>Aktiver UDS/OBD-II Tiefenscan (Startfenster)</h4>
+            <p style="margin:0; font-size:.82rem; color:var(--on-surface-variant)">
+              Aktive UDS/OBD-II Abfragen laufen sicher im kurzen ELM327-Startfenster beim Zündung-EIN (wenn „beim Start auslesen“ aktiv oder Scan vorgemerkt ist), ohne das LKAS-Relais während der Fahrt zu unterbrechen.
+            </p>
             <div class="gx-actions">
               <button type="button" class="gx-btn" :disabled="state.busy" @click="act('scan_dtcs')">Steuergeräte scannen</button>
               <select class="gx-field" v-model="state.clearTarget">
@@ -599,11 +724,15 @@ export const IoniqToolsPage = {
                   <div class="gx-ioniq__stat"><span>Scan-Zeitpunkt</span><strong>{{ formatTimestamp(lastScan.scannedAt) }}</strong></div>
                   <div class="gx-ioniq__stat"><span>Steuergeräte</span><strong>{{ lastScan.ecusResponded }}/{{ lastScan.ecusTotal }} online</strong></div>
                   <div class="gx-ioniq__stat"><span>Fehlercodes</span><strong>{{ lastScan.analysis?.activeCount || 0 }} Aktiv · {{ lastScan.analysis?.pendingCount || 0 }} Ausst. · {{ lastScan.analysis?.historicCount || 0 }} Hist.</strong></div>
+                  <div v-if="lastScan.durationMs" class="gx-ioniq__stat"><span>Scan-Dauer</span><strong>{{ lastScan.durationMs }} ms</strong></div>
                 </div>
                 <div v-if="lastScan.readiness" class="gx-ioniq__dtc-box">
                   <strong>OBD-II Readiness (0x7E0):</strong> MIL {{ lastScan.readiness.milOn ? 'AN' : 'Aus' }} ·
                   Abgas-DTCs: {{ lastScan.readiness.emissionDtcCount }} ·
                   Offene Tests: {{ (lastScan.readiness.incompleteMonitors || []).length ? lastScan.readiness.incompleteMonitors.join(', ') : 'Alle abgeschlossen' }}
+                </div>
+                <div v-if="(lastScan.obdSupportedPids || []).length" class="gx-ioniq__dtc-box">
+                  <strong>Unterstützte OBD-II PIDs (0x7E0):</strong> {{ lastScan.obdSupportedPids.join(', ') }}
                 </div>
                 <div v-if="lastScan.freezeFrame" class="gx-ioniq__dtc-box">
                   <strong>OBD Freeze-Frame ({{ lastScan.freezeFrame.dtcCode }}):</strong>
@@ -664,6 +793,7 @@ export const IoniqToolsPage = {
                   </div>
                   <div style="font-size:.72rem; color:var(--text-muted)">
                     {{ ecu.txHex }}/{{ ecu.rxHex }}
+                    <span v-if="ecu.online && ecu.busUsed !== null && ecu.busUsed !== undefined"> · {{ ecu.busUsed === 0 ? 'C-CAN' : 'OBD-II' }}</span>
                     <span v-if="ecu.partNumber"> · {{ ecu.partNumber }}</span>
                     <span v-if="ecu.softwareVersion"> · SW {{ ecu.softwareVersion }}</span>
                   </div>

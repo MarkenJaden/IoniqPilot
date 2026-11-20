@@ -86,6 +86,11 @@ test('IoniqToolsPage exposes standalone Tools layout and handles mode transition
   assert.match(IoniqToolsPage.template, /12V-Hilfsbatterie &amp; IBS-Diagnose/)
   assert.match(IoniqToolsPage.template, /Hybrid-Thermik &amp; Warmlauf-Monitor/)
   assert.match(IoniqToolsPage.template, /Verbrauchs-Datenquellen Diagnose/)
+  assert.match(IoniqToolsPage.template, /clusterAvgFcL100/)
+  assert.match(IoniqToolsPage.template, /fuel\.refuelLog/)
+  assert.match(IoniqToolsPage.template, /CAN-Verbrauchsanalyse \(Rohdaten-Mitschnitt\)/)
+  assert.match(IoniqToolsPage.template, /Live-CAN Echtzeit-Monitor \(während der Fahrt aktiv\)/)
+  assert.match(IoniqToolsPage.template, /Aktiver UDS\/OBD-II Tiefenscan \(Startfenster\)/)
 
   let loads = 0
   let aborted = 0

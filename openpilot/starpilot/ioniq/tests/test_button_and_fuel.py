@@ -10,10 +10,12 @@ from unittest.mock import patch
 
 from openpilot.starpilot.galaxy.ioniq_tools import IoniqTools, IoniqToolsChanged
 from openpilot.starpilot.ioniq.button_learner import ButtonLearnEngine, ButtonMatcher, execute_button_action
+from openpilot.starpilot.ioniq.can_discovery import CanFuelDiscoveryRecorder
 from openpilot.starpilot.ioniq.can_signals import (
   ADDR_CLU12,
   ADDR_CLU13,
   ADDR_EMS11,
+  ADDR_EMS14,
   ADDR_EMS20,
   ADDR_EMS_H12,
   ADDR_WHL_SPD11,
@@ -615,6 +617,118 @@ class TestButtonAndFuel(unittest.TestCase):
       self.assertIn('clusterAvgFcUnitLabel', diag['liveSummary'])
       self.assertGreater(diag['liveSummary']['instantFuelRateLph'], 0.0)
       self.assertTrue(res is not None)
+
+  def test_ems14_fco_validation_and_duty_cycle_rejection(self) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+      tracker = FuelTripTracker(tmp)
+      st = IoniqCanState()
+      fco14 = 1000
+      for i in range(40):
+        mono = float(i)
+        st.apply_frame(mono, ADDR_EMS11, encode_intel([(0, 1, 1), (1, 1, 1), (16, 16, 7200), (48, 8, 65)]))
+        st.apply_frame(mono, ADDR_EMS_H12, encode_intel([(16, 8, 90), (61, 1, 1)]))
+        st.apply_frame(mono, ADDR_EMS14, encode_intel([(8, 16, fco14 & 0xFFFF)]))
+        fco14 += 3500
+        snap = tracker.update(st, mono, wall_time=5000.0 + mono)
+      self.assertEqual(snap['activeTrip']['sourceMode'], 'fco_ems14')
+      self.assertTrue(snap['sourceDiagnostics']['ems14FcoValid'])
+
+    # Fluctuating BAT_Alt_FR_Duty bytes (up/down oscillations) must be rejected and fall back to torque_model
+    with tempfile.TemporaryDirectory() as tmp:
+      tracker = FuelTripTracker(tmp)
+      st = IoniqCanState()
+      for i in range(40):
+        mono = float(i)
+        st.apply_frame(mono, ADDR_EMS11, encode_intel([(0, 1, 1), (1, 1, 1), (16, 16, 7200), (48, 8, 65)]))
+        st.apply_frame(mono, ADDR_EMS_H12, encode_intel([(16, 8, 90), (61, 1, 1)]))
+        duty_noise = 120 if (i % 2 == 0) else 40
+        st.apply_frame(mono, ADDR_EMS14, encode_intel([(8, 16, duty_noise)]))
+        snap = tracker.update(st, mono, wall_time=6000.0 + mono)
+      self.assertEqual(snap['activeTrip']['sourceMode'], 'torque_model')
+      self.assertFalse(snap['sourceDiagnostics']['ems14FcoValid'])
+
+  def test_can_fuel_discovery_recorder_and_galaxy_export(self) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+      params = MemoryParams()
+      ctrl = IoniqRuntimeController(root=tmp, params_obj=params)
+      cp = SimpleNamespace(brand='hyundai', carFingerprint='HYUNDAI_IONIQ', notCar=False)
+      current = SimpleNamespace(cp=cp, parked=False)
+      ctx = SimpleNamespace(sample=lambda: current, close=lambda: None)
+      tools = IoniqTools(params, ctx, root=tmp)
+
+      # Allowed while driving!
+      page = tools.page('tok1', b'gen1')
+      start_res = tools.action({'view': page['view'], 'action': 'start_can_discovery', 'label': 'Test-Discovery'}, 'tok1', b'gen1')
+      self.assertTrue(start_res['queued'])
+
+      # Drive 10s EV (noise counter changes on 0x555 offset 0) + 10s ICE (unknown fuel counter increments on 0x553 offset 2 LE)
+      ice_counter = 100
+      ev_noise = 10
+      for i in range(20):
+        mono = 1.0 + float(i)
+        is_ice = i >= 10
+        rpm_raw = 7200 if is_ice else 0
+        tq_raw = 90 if is_ice else 0
+        if is_ice:
+          ice_counter += 2200
+        else:
+          ev_noise += 150
+        frames = [
+          (0, ADDR_EMS11, encode_intel([(0, 1, 1), (1, 1, 1 if is_ice else 0), (16, 16, rpm_raw), (32, 8, tq_raw), (48, 8, 50)])),
+          (0, ADDR_WHL_SPD11, encode_intel([(0, 14, 1600), (16, 14, 1600), (32, 14, 1600), (48, 14, 1600)])),
+          (0, 0x553, (0).to_bytes(2, 'little') + (ice_counter & 0xFFFF).to_bytes(2, 'little') + b'\x00\x00\x00\x00'),
+          (0, 0x555, (ev_noise & 0xFFFF).to_bytes(2, 'little') + b'\x00\x00\x00\x00\x00\x00'),
+        ]
+        ctrl.step(frames, mono_s=mono, wall_time=10000.0 + mono)
+
+      stop_res = tools.action(
+        {'view': page['view'], 'action': 'stop_can_discovery', 'dashboardLPer100Km': 5.2, 'dashboardDistanceKm': 0.5, 'notes': 'B1'},
+        'tok1',
+        b'gen1',
+      )
+      self.assertTrue(stop_res['queued'])
+      ctrl.step([], mono_s=21.5, wall_time=10021.5)
+
+      page2 = tools.page('tok1', b'gen1')
+      captures = page2['discovery']['captures']
+      self.assertEqual(len(captures), 1)
+      cap_id = captures[0]['id']
+      top = captures[0]['topCandidate']
+      self.assertIsNotNone(top)
+      assert top is not None
+      self.assertEqual(top['addressHex'], '0x553')
+      self.assertEqual(top['byteOffset'], 2)
+      self.assertEqual(top['endian'], 'le')
+
+      # Export allowed while driving
+      exported = tools.action({'view': page2['view'], 'action': 'export_can_discovery', 'id': cap_id}, 'tok1', b'gen1')
+      self.assertTrue(exported['ok'])
+      self.assertIn('0x553', exported['json'])
+
+      # Delete requires parked
+      with self.assertRaises(IoniqToolsChanged):
+        tools.action({'view': page2['view'], 'action': 'delete_can_discovery', 'confirmed': True, 'id': cap_id}, 'tok1', b'gen1')
+      current.parked = True
+      deleted = tools.action({'view': page2['view'], 'action': 'delete_can_discovery', 'confirmed': True, 'id': cap_id}, 'tok1', b'gen1')
+      self.assertTrue(deleted['saved'])
+      self.assertEqual(CanFuelDiscoveryRecorder(tmp).list_captures(), [])
+
+  def test_scan_on_start_and_dual_bus_mux_sequence(self) -> None:
+    from openpilot.starpilot.ioniq.storage import read_config, write_config
+    with tempfile.TemporaryDirectory() as tmp:
+      cfg = read_config(tmp)
+      cfg['scanOnStart'] = True
+      write_config(cfg, tmp)
+      bus = MockIsoTpBus()
+      obd_states: list[bool] = []
+      res = maybe_run_startup_diagnostic(
+        bus.can_recv, bus.can_send, lambda enabled: obd_states.append(enabled), brand='hyundai', root=tmp,
+      )
+      self.assertIsNotNone(res)
+      assert res is not None
+      self.assertTrue(res['ranScan'])
+      self.assertEqual(obd_states, [True, False])
+      self.assertEqual(res['scan']['transport'], 'isotp_elm327_dual_bus')
 
 
 if __name__ == '__main__':

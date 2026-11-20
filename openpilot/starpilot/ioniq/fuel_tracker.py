@@ -217,6 +217,9 @@ class FuelTripTracker:
     self._last_fco_raw: int | None = None
     self._fco_valid_ticks: int = 0
     self._fco_rejected_ticks: int = 0
+    self._last_ems14_fco_raw: int | None = None
+    self._ems14_fco_valid_ticks: int = 0
+    self._ems14_fco_rejected_ticks: int = 0
     self._integrated_distance_km: float = 0.0
     self._start_odometer_km: float | None = None
     self._min_fuel_disp_seen: int | None = None
@@ -260,6 +263,7 @@ class FuelTripTracker:
       'odometerEndKm': odo,
       'fuelLiters': 0.0,
       'fuelLitersFco': 0.0,
+      'fuelLitersFcoEms14': 0.0,
       'fuelLitersModel': 0.0,
       'fuelLitersClusterFallback': 0.0,
       'instantFuelRateLph': 0.0,
@@ -290,6 +294,9 @@ class FuelTripTracker:
     self._hev_ice_on = False
     self._hev_ice_hold_until_mono = mono_s
     self._hev_ice_ever_fired = False
+    self._last_ems14_fco_raw = can_state.ems14_fco_raw
+    self._ems14_fco_valid_ticks = 0
+    self._ems14_fco_rejected_ticks = 0
 
     tank = self.state['currentTank']
     if tank.get('startOdometerKm') is None and odo is not None:
@@ -299,11 +306,23 @@ class FuelTripTracker:
     self._dirty = True
     return trip
 
+  def _ems14_fco_is_valid(self, ems14_total: float, model_total: float, *, check_totals: bool = True) -> bool:
+    if self._ems14_fco_valid_ticks < 5:
+      return False
+    if self._ems14_fco_rejected_ticks > max(0, int(self._ems14_fco_valid_ticks * 0.05)):
+      return False
+    if not check_totals:
+      return True
+    if ems14_total < max(0.001, model_total * 0.25):
+      return False
+    return model_total < 0.005 or ems14_total <= model_total * 3.5
+
   def _build_source_diagnostics(self, can_state: IoniqCanState, trip: dict[str, Any] | None) -> dict[str, Any]:
     seen = can_state.seen_addresses
     has_ems11 = 0x316 in seen
     has_ems_h12 = 0x18F in seen
     has_ems20 = 0x200 in seen
+    has_ems14 = 0x545 in seen
     has_clu12 = 0x5B0 in seen
     has_clu13 = 0x50C in seen
     has_whl_spd = 0x386 in seen
@@ -311,11 +330,15 @@ class FuelTripTracker:
     mode = (trip or {}).get('sourceMode', default_mode)
     mode_labels = {
       'fco_can': 'Direkte Einspritzmenge (EMS20 0x200 FCO)',
+      'fco_ems14': 'Direkte Einspritzmenge (EMS14 0x545 FCO)',
       'obd_pid': 'OBD-II Live-Sensorik (MAF / Fuel Rate)',
       'torque_model': 'Atkinson-Kennfeldmodell (EMS11 Drehzahl/Drehmoment)',
       'hev_model': 'HEV Traktions-/Rekuperationsmodell (C-CAN)',
       'cluster_avg_fci': 'Kombiinstrument-Referenz (CLU13 Durchschnittsverbrauch)',
     }
+    ems14_total = 0.0 if trip is None else float(trip.get('fuelLitersFcoEms14', 0.0))
+    model_total = 0.0 if trip is None else float(trip.get('fuelLitersModel', 0.0))
+    ems14_valid = self._ems14_fco_is_valid(ems14_total, model_total, check_totals=(trip is not None))
     return {
       'activeSource': mode,
       'activeSourceLabel': mode_labels.get(mode, mode),
@@ -324,6 +347,12 @@ class FuelTripTracker:
       'fcoRaw': can_state.fco_raw,
       'fcoValidTicks': self._fco_valid_ticks,
       'fcoRejectedTicks': self._fco_rejected_ticks,
+      'ems14FcoSeen': has_ems14,
+      'ems14FcoRaw': can_state.ems14_fco_raw,
+      'ems14FcoValid': ems14_valid,
+      'ems14FcoValidTicks': self._ems14_fco_valid_ticks,
+      'ems14FcoRejectedTicks': self._ems14_fco_rejected_ticks,
+      'ems14FcoLiters': None if trip is None else round(ems14_total, 4),
       'ems11Seen': has_ems11,
       'emsH12Seen': has_ems_h12,
       'eEms11Seen': 0x371 in seen,
@@ -344,11 +373,13 @@ class FuelTripTracker:
       'clusterAvgLPer100Km': cluster_avg_l_per_100km(can_state),
       'fcoValid': self._fco_valid_ticks >= 2,
       'fcoLiters': None if trip is None else round(float(trip.get('fuelLitersFco', 0.0)), 4),
-      'modelLiters': None if trip is None else round(float(trip.get('fuelLitersModel', 0.0)), 4),
+      'modelLiters': None if trip is None else round(model_total, 4),
       'clusterFallbackLiters': None if trip is None else round(float(trip.get('fuelLitersClusterFallback', 0.0)), 4),
       'fuelLitersFco': None if trip is None else round(float(trip.get('fuelLitersFco', 0.0)), 4),
-      'fuelLitersModel': None if trip is None else round(float(trip.get('fuelLitersModel', 0.0)), 4),
+      'fuelLitersFcoEms14': None if trip is None else round(ems14_total, 4),
+      'fuelLitersModel': None if trip is None else round(model_total, 4),
       'fuelLitersClusterFallback': None if trip is None else round(float(trip.get('fuelLitersClusterFallback', 0.0)), 4),
+      'rawFuelFrames': dict(can_state.raw_fuel_frames),
       'calibrationFactor': round(self.calibration_factor, 4),
     }
 
@@ -559,15 +590,38 @@ class FuelTripTracker:
     if fco_step_valid:
       trip['fuelLitersFco'] = round(float(trip.get('fuelLitersFco', 0.0)) + fco_inc, 5)
 
+    ems14_inc = 0.0
+    ems14_step_valid = False
+    if can_state.ems14_fco_raw is not None:
+      if self._last_ems14_fco_raw is not None:
+        raw_delta = (can_state.ems14_fco_raw - self._last_ems14_fco_raw) & 0xFFFF
+        if raw_delta == 0:
+          pass
+        elif 0 < raw_delta <= 8000 and firing:
+          ems14_inc = raw_delta * self.fco_scale_ul * 1e-6 * self.calibration_factor
+          self._ems14_fco_valid_ticks += 1
+          ems14_step_valid = True
+        else:
+          self._ems14_fco_rejected_ticks += 1
+      self._last_ems14_fco_raw = can_state.ems14_fco_raw
+
+    if ems14_step_valid:
+      trip['fuelLitersFcoEms14'] = round(float(trip.get('fuelLitersFcoEms14', 0.0)) + ems14_inc, 5)
+
     fco_total = float(trip.get('fuelLitersFco', 0.0))
+    ems14_total = float(trip.get('fuelLitersFcoEms14', 0.0))
     model_total = float(trip.get('fuelLitersModel', 0.0))
     cluster_total = float(trip.get('fuelLitersClusterFallback', 0.0))
 
-    # Choose the most authoritative non-zero source without allowing a dead FCO counter to zero out consumption
+    # Choose the most authoritative non-zero source without allowing a dead/non-FCO counter to corrupt consumption
     if self._fco_valid_ticks >= 2 and fco_total >= max(0.0005, model_total * 0.25):
       step_inc = fco_inc if fco_step_valid else (model_inc if firing else 0.0)
       trip['fuelLiters'] = round(max(fco_total, prev_fuel_total + step_inc), 5)
       trip['sourceMode'] = 'fco_can'
+    elif self._ems14_fco_is_valid(ems14_total, model_total):
+      step_inc = ems14_inc if ems14_step_valid else (model_inc if firing else 0.0)
+      trip['fuelLiters'] = round(max(ems14_total, prev_fuel_total + step_inc), 5)
+      trip['sourceMode'] = 'fco_ems14'
     elif has_obd_fuel and (model_total > 0.0001 or firing):
       trip['fuelLiters'] = round(max(model_total, prev_fuel_total + model_inc), 5)
       trip['sourceMode'] = 'obd_pid'
@@ -875,6 +929,7 @@ class FuelTripTracker:
     self.calibration_factor = clamped
     self.state['calibrationFactor'] = clamped
     self._fco_rejected_ticks = 0
+    self._ems14_fco_rejected_ticks = 0
     self._dirty = True
     self.flush(0.0)
     return clamped
