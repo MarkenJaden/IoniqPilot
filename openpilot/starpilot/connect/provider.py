@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 import base64
 import fcntl
+import functools
 import hashlib
 import json
 import os
@@ -31,8 +32,11 @@ PROVIDERS = {
                     'https://connect.comma.ai', 'user.upload'),
   'konik': Provider('konik', 'Konik', 'https://api.konik.ai', 'wss://athena.konik.ai',
                     'https://stable.konik.ai', 'user.upload.konik'),
+  'drive': Provider('drive', 'MarkenJaden Drive', 'https://drive.markenjaden.de', 'wss://drive.markenjaden.de',
+                    'https://drive.markenjaden.de', 'user.upload.drive'),
 }
-PROVIDER_NAMES = ('comma', 'konik', 'custom')
+PROVIDER_NAMES = ('comma', 'konik', 'drive', 'custom')
+NON_COMMA_PROVIDERS = ('konik', 'drive', 'custom')
 CUSTOM_UPLOAD_ATTRIBUTE = 'user.upload.custom'
 MAX_CUSTOM_URL_LEN = 256
 STATE_KEYS = ('DongleId', 'PrimeType', 'PairingProvider', 'PairingEmail', 'AthenadUploadQueue', 'AthenadRecentlyViewedRoutes',
@@ -41,6 +45,27 @@ TRANSIENT_KEYS = ('AccessToken', 'LastAthenaPingTime')
 MAX_STATE_BYTES = 8 * 1024 * 1024
 ROUTE_MARKER = '.cloud-provider'
 OFFLINE = Provider('offline', 'Cloud Unavailable', '', '', '', 'user.upload.disabled')
+
+
+@functools.lru_cache(maxsize=8)
+def loggerd_supports_provider(name: str) -> bool:
+  if name in ('comma', 'konik', 'offline'):
+    return True
+  if name not in PROVIDER_NAMES:
+    return False
+  logger_dir = Path(__file__).resolve().parents[2] / 'system' / 'loggerd'
+  binaries = [p for p in (logger_dir / 'loggerd', logger_dir / 'bootlog') if p.is_file()]
+  if not binaries:
+    return True
+  needle = f'\x00{name}\x00'.encode('ascii')
+  try:
+    return all(needle in path.read_bytes() for path in binaries)
+  except OSError:
+    return False
+
+
+def logger_connect_provider(name: str) -> str:
+  return name if loggerd_supports_provider(name) else 'offline'
 
 
 def validate_custom_url(raw_url: str, *, websocket: bool = False) -> str:
@@ -144,11 +169,14 @@ def _write(path, value):
 def configuration(root=None):
   value = _read((root or root_path()) / 'provider.json', {'active': 'comma', 'selected': 'comma', 'requestedBoot': ''})
   required = {'active', 'selected', 'requestedBoot'}
-  allowed = required | {'custom', 'pendingCustom'}
+  allowed = required | {'custom', 'pendingCustom', 'offlineMarkerOwner'}
   if (type(value) is not dict or not required <= value.keys() <= allowed or
       value['active'] not in PROVIDER_NAMES or value['selected'] not in PROVIDER_NAMES or
       type(value['requestedBoot']) is not str):
     raise ValueError('Cloud provider configuration is invalid')
+  if 'offlineMarkerOwner' in value and value['offlineMarkerOwner'] is not None:
+    if value['offlineMarkerOwner'] not in ('drive', 'custom'):
+      raise ValueError('Cloud provider configuration is invalid')
   for key in ('custom', 'pendingCustom'):
     if key in value and value[key] is not None:
       custom_provider(value[key])
@@ -282,6 +310,15 @@ def _restore(params, values):
     os.close(fd)
 
 
+def _apply_logger_param(params, value, root):
+  active = value['active']
+  marker = logger_connect_provider(active)
+  if marker == 'offline' and active in ('drive', 'custom') and value.get('offlineMarkerOwner') != active:
+    value['offlineMarkerOwner'] = active
+    _write(root / 'provider.json', value)
+  params.put('ConnectProvider', marker, block=True)
+
+
 def activate_at_boot(params, *, root=None, boot=boot_id):
   """Called before managed services start; never changes provider in a live session."""
   root = root or root_path()
@@ -294,7 +331,7 @@ def activate_at_boot(params, *, root=None, boot=boot_id):
     if journal is None:
       pending_custom = value.get('pendingCustom')
       if (value['active'] == value['selected'] and pending_custom is None) or value['requestedBoot'] == boot():
-        params.put('ConnectProvider', value['active'], block=True)
+        _apply_logger_param(params, value, root)
         return
       _write(root / value['active'] / 'params.json', _capture(params))
       if value['active'] == 'custom' and value['selected'] == 'custom' and pending_custom is not None:
@@ -312,11 +349,14 @@ def activate_at_boot(params, *, root=None, boot=boot_id):
     if 'custom' in journal and journal['custom'] is not None:
       custom_provider(journal['custom'])
     _restore(params, journal['values'])
-    params.put('ConnectProvider', journal['target'], block=True)
     value['active'] = journal['target']
     if 'custom' in journal and journal['custom'] is not None:
       value['custom'] = journal['custom']
     value.pop('pendingCustom', None)
+    marker = logger_connect_provider(value['active'])
+    if marker == 'offline' and value['active'] in ('drive', 'custom'):
+      value['offlineMarkerOwner'] = value['active']
+    params.put('ConnectProvider', marker, block=True)
     _write(root / 'provider.json', value)
     (root / 'switch.json').unlink()
     fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
@@ -328,7 +368,7 @@ def activate_at_boot(params, *, root=None, boot=boot_id):
 
 def provider_key_pair(provider_name='konik'):
   """Non-comma clouds never receive the factory comma private key."""
-  if provider_name not in ('konik', 'custom'):
+  if provider_name not in NON_COMMA_PROVIDERS:
     raise ValueError('Unknown non-comma cloud provider')
   root = root_path()
   with _exclusive(root):
@@ -398,22 +438,38 @@ def mark_recording(directory, provider_name):
     os.close(parent)
 
 
-def recording_provider(path, *, dir_fd=None):
+def resolve_marker_provider(raw: str, *, root=None) -> str | None:
+  if raw in PROVIDER_NAMES:
+    return raw
+  if raw == 'offline':
+    try:
+      cfg = configuration(root)
+    except (OSError, ValueError, TypeError, KeyError):
+      return None
+    owner = cfg.get('offlineMarkerOwner')
+    if owner in ('drive', 'custom'):
+      return owner
+    if cfg.get('active') in ('drive', 'custom'):
+      return cfg['active']
+  return None
+
+
+def recording_provider(path, *, dir_fd=None, root=None):
   """Untagged recordings predate provider selection and belong to comma."""
   marker = ROUTE_MARKER if dir_fd is not None else Path(path) / ROUTE_MARKER
   try:
     fd = os.open(marker, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
     with os.fdopen(fd, 'rb') as stream:
       value = stream.read(32).decode('ascii')
-    return value if value in PROVIDER_NAMES else None
+    return resolve_marker_provider(value, root=root)
   except FileNotFoundError:
     return 'comma'
   except (OSError, UnicodeError):
     return None
 
 
-def owns_recording(path, log_root, provider=None):
-  provider = provider or active_provider().name
+def owns_recording(path, log_root, provider=None, *, root=None):
+  provider = provider or active_provider(root).name
   try:
     relative = Path(path).resolve().relative_to(Path(log_root).resolve())
     if not relative.parts:
@@ -424,9 +480,10 @@ def owns_recording(path, log_root, provider=None):
       if marker.exists() or marker.is_symlink():
         fd = os.open(marker, os.O_RDONLY | os.O_NOFOLLOW)
         with os.fdopen(fd, 'rb') as stream:
-          return stream.read(32) == provider.encode('ascii')
-    return recording_provider(directory) == provider
-  except (OSError, ValueError):
+          raw = stream.read(32).decode('ascii')
+        return resolve_marker_provider(raw, root=root) == provider
+    return recording_provider(directory, root=root) == provider
+  except (OSError, ValueError, UnicodeError):
     return False
 
 

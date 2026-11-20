@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, UTC
 from openpilot.common.hardware.hw import Paths
 from openpilot.common.version import get_version
 
-from openpilot.starpilot.connect.provider import active_provider, provider_key_pair
+from openpilot.starpilot.connect.provider import NON_COMMA_PROVIDERS, active_provider, provider_key_pair
 
 API_HOST = os.getenv('API_HOST', 'https://api.commadotai.com')
 
@@ -58,14 +58,15 @@ def api_get(endpoint, method='GET', timeout=None, access_token=None, session=Non
 
   # TODO: add session to Api
   req = requests if session is None else session
-  return req.request(method, (API_HOST if provider.name == "comma" else provider.api) + "/" + endpoint, timeout=timeout, headers=headers, params=params)
+  base_url = (API_HOST if provider.name == "comma" else provider.api).rstrip("/")
+  return req.request(method, base_url + "/" + endpoint.lstrip("/"), timeout=timeout, headers=headers, params=params)
 
 
 def get_key_pair() -> tuple[str, str, str] | tuple[None, None, None]:
   provider = active_provider()
   if provider.name == 'offline' or os.getenv('STARPILOT_CLOUD_DISABLED') == '1':
     return None, None, None
-  if provider.name in ('konik', 'custom'):
+  if provider.name in NON_COMMA_PROVIDERS:
     return provider_key_pair(provider.name)
   for key in KEYS:
     if os.path.isfile(Paths.persist_root() + f'/comma/{key}') and os.path.isfile(Paths.persist_root() + f'/comma/{key}.pub'):

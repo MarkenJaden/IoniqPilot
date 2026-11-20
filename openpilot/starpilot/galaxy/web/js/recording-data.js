@@ -52,7 +52,7 @@ export function routeDate(route, locale = undefined, timeZone = undefined) {
 export function connectRouteUrl(route) {
   if (typeof route?.routeId !== "string" || !LOCAL.test(route.routeId) || typeof route.connectUrl !== "string") return null
   const provider = route.provider ?? "comma"
-  if (!["comma", "konik", "custom"].includes(provider)) return null
+  if (!["comma", "konik", "drive", "custom"].includes(provider)) return null
   let parsed
   try {
     parsed = new URL(route.connectUrl)
@@ -60,7 +60,10 @@ export function connectRouteUrl(route) {
     return null
   }
   if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.search || parsed.hash) return null
-  const expectedHost = provider === "konik" ? "stable.konik.ai" : provider === "comma" ? "connect.comma.ai" : null
+  const expectedHost = provider === "konik" ? "stable.konik.ai"
+    : provider === "comma" ? "connect.comma.ai"
+    : provider === "drive" ? "drive.markenjaden.de"
+    : null
   if (expectedHost !== null && (parsed.hostname !== expectedHost || parsed.port !== "")) return null
   const match = /\/([a-f0-9]{16})\/([^/?#]+)$/.exec(parsed.pathname)
   if (!match || (expectedHost !== null && parsed.pathname !== `/${match[1]}/${match[2]}`)) return null

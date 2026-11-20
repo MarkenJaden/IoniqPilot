@@ -27,8 +27,8 @@ def main():
 
   try:
     while 1:
-      from openpilot.starpilot.connect.provider import active_provider
-      if active_provider().name in ('konik', 'custom'):
+      from openpilot.starpilot.connect.provider import NON_COMMA_PROVIDERS, active_provider
+      if active_provider().name in NON_COMMA_PROVIDERS:
         from openpilot.system.athena.registration import register, UNREGISTERED_DONGLE_ID
         if register() == UNREGISTERED_DONGLE_ID:
           time.sleep(15)

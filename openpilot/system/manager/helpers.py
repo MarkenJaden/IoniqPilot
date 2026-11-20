@@ -56,6 +56,20 @@ def save_bootlog():
     env['PARAMS_COPY_PATH'] = tmpdir
     subprocess.call("./bootlog", cwd=os.path.join(BASEDIR, "openpilot/system/loggerd"), env=env)
     shutil.rmtree(tmpdir)
+    try:
+      from openpilot.common.hardware.hw import Paths
+      from openpilot.starpilot.connect.provider import active_provider
+      provider = active_provider().name
+      if provider in ('drive', 'custom'):
+        boot_id = Params().get("CurrentBootlog")
+        if boot_id:
+          marker = pathlib.Path(Paths.log_root()) / 'boot' / f'.cloud-{boot_id}.zst'
+          if marker.is_file() and not marker.is_symlink() and marker.read_text() == 'offline':
+            tmp_marker = marker.with_name(f'.cloud-{boot_id}.zst.tmp')
+            tmp_marker.write_text(provider)
+            os.replace(tmp_marker, marker)
+    except (OSError, ImportError, ValueError):
+      pass
   t = threading.Thread(target=fn, args=(tmp, ))
   t.daemon = True
   t.start()

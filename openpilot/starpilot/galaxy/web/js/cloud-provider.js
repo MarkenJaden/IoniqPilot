@@ -4,12 +4,13 @@ import { requestJson } from "./startup.js"
 import { GalaxySelect } from "./galaxy-select.js"
 import { GxNotice } from "./notice.js"
 
-const PROVIDER_IDS = ["comma", "konik", "custom"]
+const PROVIDER_IDS = ["comma", "konik", "drive", "custom"]
 
 const validProviderEntry = p => {
   if (!p || !PROVIDER_IDS.includes(p.id) || typeof p.label !== "string" || typeof p.url !== "string") return false
   if (p.id === "comma") return p.url === "https://connect.comma.ai"
   if (p.id === "konik") return p.url === "https://stable.konik.ai"
+  if (p.id === "drive") return p.url === "https://drive.markenjaden.de"
   return p.url === "" || /^https:\/\/[^/?#\s]+/.test(p.url)
 }
 
@@ -19,7 +20,7 @@ const validCustomConfig = value => value == null ||
 export const validProviderStatus = value => Boolean(value && PROVIDER_IDS.includes(value.active) &&
   PROVIDER_IDS.includes(value.selected) && /^[a-f0-9]{64}$/.test(value.revision) &&
   typeof value.restartRequired === "boolean" && typeof value.canSelect === "boolean" &&
-  Array.isArray(value.providers) && value.providers.length === 3 &&
+  Array.isArray(value.providers) && value.providers.length === PROVIDER_IDS.length &&
   PROVIDER_IDS.every(name => value.providers.filter(p => p.id === name).length === 1) &&
   value.providers.every(validProviderEntry) && validCustomConfig(value.custom))
 
@@ -121,11 +122,11 @@ export const CloudProviderPage = {
       </label></div></div>
       <form v-if="showCustomForm" @submit.prevent="saveCustom">
         <div class="gx-row"><label class="gx-settings__developer-provider">Custom server URL
-          <input class="gx-field" type="url" v-model="customUrl" placeholder="https://cloud.example.com" maxlength="256" required :disabled="!status?.canSelect" autocomplete="off" spellcheck="false"></label></div>
-        <div class="gx-row"><label class="gx-settings__developer-provider">Athena WebSocket URL (optional)
-          <input class="gx-field" v-model="customAthena" placeholder="wss://cloud.example.com" maxlength="256" :disabled="!status?.canSelect" autocomplete="off" spellcheck="false"></label></div>
+          <input class="gx-field" type="text" v-model="customUrl" placeholder="https://cloud.example.com" maxlength="256" required :disabled="!status?.canSelect" autocomplete="off" spellcheck="false"></label></div>
+        <div class="gx-row"><label class="gx-settings__developer-provider">Athena WSS URL (optional)
+          <input class="gx-field" type="text" v-model="customAthena" placeholder="wss://cloud.example.com" maxlength="256" :disabled="!status?.canSelect" autocomplete="off" spellcheck="false"></label></div>
         <div class="gx-row"><label class="gx-settings__developer-provider">Web URL (optional)
-          <input class="gx-field" type="url" v-model="customWeb" placeholder="https://cloud.example.com" maxlength="256" :disabled="!status?.canSelect" autocomplete="off" spellcheck="false"></label></div>
+          <input class="gx-field" type="text" v-model="customWeb" placeholder="https://cloud.example.com" maxlength="256" :disabled="!status?.canSelect" autocomplete="off" spellcheck="false"></label></div>
         <div class="gx-row"><button class="gx-btn" type="submit" :disabled="!status?.canSelect || busy"><i class="bi bi-check-lg" aria-hidden="true"></i> Use Custom Cloud</button></div>
       </form></section>
       <GxNotice v-if="status?.restartRequired" tone="warn">{{ selected?.label }}<template v-if="selected?.id === 'custom' && selected?.url"> ({{ selected.url }})</template> applies after the next reboot. No automatic reboot will occur.</GxNotice>

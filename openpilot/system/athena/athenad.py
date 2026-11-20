@@ -52,7 +52,7 @@ from openpilot.system.athena.rpc import (boolean, dict_of, dispatcher, dumps_cal
                                          list_of, loads, number, one_of, regex, struct)
 
 
-from openpilot.starpilot.connect.provider import active_provider, owns_recording, cloudlog_root, mark_recording
+from openpilot.starpilot.connect.provider import PROVIDER_NAMES, active_provider, owns_recording, cloudlog_root, mark_recording
 
 CLOUD_PROVIDER = active_provider()
 ATHENA_HOST = os.getenv('ATHENA_HOST', CLOUD_PROVIDER.athena) if CLOUD_PROVIDER.name == 'comma' else CLOUD_PROVIDER.athena
@@ -576,7 +576,7 @@ class VideoClips:
     return available
 
   def _source_inputs(self, route, camera, start, end):
-    if (self.clip_provider not in ("comma", "konik", "custom") or not math.isfinite(start) or not math.isfinite(end) or
+    if (self.clip_provider not in PROVIDER_NAMES or not math.isfinite(start) or not math.isfinite(end) or
         start < 0 or end <= start):
       raise ValueError("Invalid clip source range")
     inputs = [os.path.join(Paths.log_root(), f"{route}--{segment}", camera)

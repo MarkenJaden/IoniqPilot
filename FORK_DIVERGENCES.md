@@ -28,7 +28,8 @@
 
 3. **Merged Upstream Feature Branches (Also kept intact as separate PR branches)**
    - `vienna-speed-limit`: Vienna convention speed-limit sign styling & UI toggle (`PR branch` on `StarPilotHQ/StarPilot`).
-   - `custom-cloud-provider`: Custom connect/cloud endpoint support alongside comma/konik (`PR branch` on `StarPilotHQ/StarPilot`).
+   - `custom-cloud-provider`: Custom connect/cloud endpoint support alongside comma/konik (`PR branch` on `StarPilotHQ/StarPilot`), extended in `IoniqPilot` with fixed `drive` (`MarkenJaden Drive`, `https://drive.markenjaden.de`) preset, bare-host Custom URL input support, and prebuilt `loggerd`/`bootlog` `"offline"` marker ownership aliasing (`offlineMarkerOwner` in `provider.py` + bootlog `.cloud-*` re-tagging in `openpilot/system/manager/helpers.py`).
+   - `openpilot/starpilot/ioniq/drive_sync.py`: Background Drive telemetry, Tank-to-Tank fuel consumption, ECU diagnostics, flight recording bundle, and per-segment GPS/event metadata sync (`POST /v1/devices/:id/ioniq/sync` and `/v1/devices/:id/route_meta`).
 
 4. **German Speed Limit Controller (SLC) Overhaul & EU Vision Training Scaffold**
    - `openpilot/starpilot/speed_limits/preferences.py`: Atomic JSON persistence under `starpilot_storage_root() / 'slc' / 'preferences.json'` (with mtime-cached `load_preferences_cached()`), avoiding any new keys in `openpilot/common/params_keys.h`.

@@ -78,7 +78,7 @@ class TestCustomProviderLifecycle(unittest.TestCase):
       params.put('DongleId', '0123456789abcdef')
 
       initial = p.status(root)
-      self.assertEqual([item['id'] for item in initial['providers']], ['comma', 'konik', 'custom'])
+      self.assertEqual([item['id'] for item in initial['providers']], ['comma', 'konik', 'drive', 'custom'])
 
       with self.assertRaises(ValueError):
         p.select_provider('custom', initial['revision'], lambda: True, root=root, boot=lambda: 'b1')
@@ -93,9 +93,10 @@ class TestCustomProviderLifecycle(unittest.TestCase):
       p.activate_at_boot(params, root=root, boot=lambda: 'b1')
       self.assertEqual(params.get('DongleId'), '0123456789abcdef')
 
-      p.activate_at_boot(params, root=root, boot=lambda: 'b2')
-      self.assertIsNone(params.get('DongleId'))
-      self.assertEqual(params.get('ConnectProvider'), 'custom')
+      with patch.object(p, 'loggerd_supports_provider', return_value=True):
+        p.activate_at_boot(params, root=root, boot=lambda: 'b2')
+        self.assertIsNone(params.get('DongleId'))
+        self.assertEqual(params.get('ConnectProvider'), 'custom')
       params.put('DongleId', 'aaaaaaaaaaaaaaaa')
 
       second = p.status(root)
@@ -158,6 +159,42 @@ class TestCustomProviderLifecycle(unittest.TestCase):
         details = recording_details({'routes': [{'routeId': '2026-10-01--12-00-00', 'provider': 'custom'}]}, {}, None,
                                     device_ids={'custom': '0123456789abcdef'})
         self.assertEqual(details['routes'][0]['connectUrl'], 'https://custom-web.test/0123456789abcdef/2026-10-01--12-00-00')
+
+  def test_fixed_drive_preset_and_prebuilt_logger_marker_compatibility(self):
+    drive = p.PROVIDERS['drive']
+    self.assertEqual(drive.label, 'MarkenJaden Drive')
+    self.assertEqual(drive.api, 'https://drive.markenjaden.de')
+    self.assertEqual(drive.athena, 'wss://drive.markenjaden.de')
+    self.assertEqual(drive.web, 'https://drive.markenjaden.de')
+
+    with tempfile.TemporaryDirectory() as directory:
+      root = Path(directory) / 'cloud'
+      params = ParamsFiles(Path(directory) / 'params')
+      logs = Path(directory) / 'logs'
+      seg = logs / '00000001--abcdef0123--0'
+      seg.mkdir(parents=True)
+      (seg / 'qlog.zst').write_bytes(b'log')
+      (seg / p.ROUTE_MARKER).write_text('offline')
+
+      with patch.object(p, 'root_path', return_value=root):
+        rev = p.status(root)['revision']
+        p.select_provider('drive', rev, lambda: True, root=root, boot=lambda: 'b1')
+        with patch.object(p, 'loggerd_supports_provider', return_value=False):
+          p.activate_at_boot(params, root=root, boot=lambda: 'b2')
+          self.assertEqual(params.get('ConnectProvider'), 'offline')
+          self.assertEqual(p.configuration(root).get('offlineMarkerOwner'), 'drive')
+          self.assertTrue(p.owns_recording(seg / 'qlog.zst', logs, 'drive', root=root))
+          self.assertFalse(p.owns_recording(seg / 'qlog.zst', logs, 'comma', root=root))
+          self.assertFalse(p.owns_recording(seg / 'qlog.zst', logs, 'konik', root=root))
+
+        drive_pair = p.provider_key_pair('drive')
+        konik_pair = p.provider_key_pair('konik')
+        self.assertEqual(drive_pair[0], 'RS256')
+        self.assertNotEqual(drive_pair[1], konik_pair[1])
+
+        details = recording_details({'routes': [{'routeId': '2026-10-01--12-00-00', 'provider': 'drive'}]}, {}, None,
+                                    device_ids={'drive': '0123456789abcdef'})
+        self.assertEqual(details['routes'][0]['connectUrl'], 'https://drive.markenjaden.de/0123456789abcdef/2026-10-01--12-00-00')
 
 
 class TestCustomProviderHTTP(unittest.TestCase):

@@ -22,7 +22,7 @@ from openpilot.system.loggerd.xattr_cache import getxattr, setxattr
 from openpilot.common.swaglog import cloudlog
 
 NetworkType = log.DeviceState.NetworkType
-from openpilot.starpilot.connect.provider import active_provider, owns_recording
+from openpilot.starpilot.connect.provider import NON_COMMA_PROVIDERS, active_provider, owns_recording
 
 UPLOAD_ATTR_NAME = active_provider().upload_attribute
 UPLOAD_ATTR_VALUE = b'1'
@@ -187,7 +187,7 @@ class Uploader:
 
     guard()
     url_resp = self.api.get("v1.4/" + self.dongle_id + "/upload_url/", timeout=10, path=key, access_token=self.api.get_token())
-    if url_resp.status_code == 412:
+    if url_resp.status_code != 200:
       return url_resp
 
     url_resp_json = json.loads(url_resp.text)
@@ -202,7 +202,7 @@ class Uploader:
     try:
       compress = key.endswith('.zst') and not fn.endswith('.zst')
       stream, length = get_upload_stream(fn, compress)
-      response = requests.put(url, data=CallbackReader(stream, guard, length), headers=headers, timeout=10)
+      response = requests.put(url, data=CallbackReader(stream, guard, length), headers=headers, timeout=(10, 60))
       return response
     finally:
       if stream:
@@ -288,7 +288,7 @@ def main(exit_event: threading.Event | None = None) -> None:
   params = Params()
   dongle_id = params.get("DongleId")
 
-  while active_provider().name in ('konik', 'custom') and dongle_id in (None, 'UnregisteredDevice') and not exit_event.is_set():
+  while active_provider().name in NON_COMMA_PROVIDERS and dongle_id in (None, 'UnregisteredDevice') and not exit_event.is_set():
     exit_event.wait(10)
     dongle_id = params.get('DongleId')
   if exit_event.is_set():

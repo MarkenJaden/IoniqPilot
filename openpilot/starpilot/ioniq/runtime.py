@@ -6,6 +6,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 import logging
+import os
 import signal
 import threading
 import time
@@ -456,7 +457,7 @@ def _default_runtime_setup() -> tuple[Any, ...]:
   can_sock = messaging.sub_sock('can', timeout=20)
   sendcan = messaging.pub_sock('sendcan')
   can_recv, can_send = can_comm_callbacks(can_sock, sendcan)
-  sm = messaging.SubMaster(['deviceState', 'carState', 'pandaStates'])
+  sm = messaging.SubMaster(['deviceState', 'carState', 'pandaStates', 'gpsLocationExternal', 'selfdriveState'])
   rk = Ratekeeper(20, print_delay_threshold=None)
   return controller, messaging, can_sock, sm, can_recv, can_send, rk
 
@@ -489,6 +490,7 @@ def main(
 
   init_runtime = setup_fn or _default_runtime_setup
   controller: Any = None
+  sync_worker: Any = None
   backoff_s = 1.0
 
   try:
@@ -507,6 +509,17 @@ def main(
           return
         backoff_s = min(backoff_s * 2.0, 30.0)
 
+    if setup_fn is None:
+      try:
+        from openpilot.common.hardware import PC
+        if not PC or os.getenv('IONIQ_DRIVE_SYNC') == '1':
+          from openpilot.starpilot.ioniq.drive_sync import DriveSyncWorker
+          sync_worker = DriveSyncWorker()
+          sync_worker.start()
+      except Exception:
+        cloudlog.exception('ioniqd DriveSyncWorker startup failed')
+        sync_worker = None
+
     while not stop.is_set():
       try:
         sm.update(0)
@@ -524,17 +537,30 @@ def main(
           except Exception:
             elm_active = False
         car_state_msg = sm['carState'] if sm.alive.get('carState') else None
+        gps_msg = sm['gpsLocationExternal'] if sm.alive.get('gpsLocationExternal') else None
+        selfdrive_msg = sm['selfdriveState'] if sm.alive.get('selfdriveState') else None
 
-        controller.step(
+        mono_now = time.monotonic()
+        wall_now = _utc_timestamp()
+        step_res = controller.step(
           frames,
-          mono_s=time.monotonic(),
-          wall_time=_utc_timestamp(),
+          mono_s=mono_now,
+          wall_time=wall_now,
           ignition_hint=ign_hint,
           elm327_active=elm_active,
           can_send=can_send if elm_active else None,
           can_recv=can_recv if elm_active else None,
           car_state_msg=car_state_msg,
         )
+        if sync_worker is not None and isinstance(step_res, dict):
+          sync_worker.observe_step(
+            mono_s=mono_now,
+            wall_time=wall_now,
+            onroad=bool(ign_hint) if ign_hint is not None else False,
+            fuel_snap=step_res.get('fuel'),
+            gps_msg=gps_msg,
+            selfdrive_msg=selfdrive_msg,
+          )
         backoff_s = 1.0
         rk.keep_time()
       except KeyboardInterrupt:
@@ -554,6 +580,11 @@ def main(
         controller.shutdown()
       except Exception:
         cloudlog.exception('ioniqd shutdown failed')
+    if sync_worker is not None:
+      try:
+        sync_worker.stop()
+      except Exception:
+        cloudlog.exception('ioniqd DriveSyncWorker shutdown failed')
 
 
 if __name__ == '__main__':

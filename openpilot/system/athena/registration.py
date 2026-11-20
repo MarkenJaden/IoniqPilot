@@ -7,7 +7,7 @@ from pathlib import Path
 
 from datetime import datetime, timedelta, UTC
 from openpilot.common.api import api_get, get_key_pair
-from openpilot.starpilot.connect.provider import active_provider
+from openpilot.starpilot.connect.provider import NON_COMMA_PROVIDERS, active_provider
 import os
 import re
 from openpilot.common.params import Params
@@ -38,7 +38,7 @@ def register(show_spinner=False) -> str | None:
   params = Params()
   if os.getenv('STARPILOT_CLOUD_DISABLED') == '1':
     return UNREGISTERED_DONGLE_ID
-  if active_provider().name in ('konik', 'custom'):
+  if active_provider().name in NON_COMMA_PROVIDERS:
     return register_konik(params)
 
   dongle_id: str | None = params.get("DongleId")

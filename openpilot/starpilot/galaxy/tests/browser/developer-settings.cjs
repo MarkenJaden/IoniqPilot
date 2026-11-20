@@ -18,6 +18,7 @@ const assert = require('node:assert/strict')
         restartRequired: false, canSelect: parked, custom: null, providers: [
           { id: 'comma', label: 'comma', url: 'https://connect.comma.ai' },
           { id: 'konik', label: 'Konik', url: 'https://stable.konik.ai' },
+          { id: 'drive', label: 'MarkenJaden Drive', url: 'https://drive.markenjaden.de' },
           { id: 'custom', label: 'Custom', url: '' }] }
       else if (path.endsWith('/connect/proxy')) data = { enabled: false, address: '', origin: '', revision: 'proxy', canEdit: parked, passwordConfigured: true }
       else if (path.endsWith('/pages/developer')) data = { page: 'developer', title: 'Developer driving options',

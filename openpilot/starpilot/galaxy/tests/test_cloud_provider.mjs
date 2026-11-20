@@ -16,6 +16,7 @@ const baseStatus = () => ({
   providers: [
     { id: "comma", label: "comma connect", url: "https://connect.comma.ai" },
     { id: "konik", label: "Konik", url: "https://stable.konik.ai" },
+    { id: "drive", label: "MarkenJaden Drive", url: "https://drive.markenjaden.de" },
     { id: "custom", label: "Custom", url: "" },
   ],
 })
@@ -35,6 +36,7 @@ test("validProviderStatus accepts default and custom cloud configurations", () =
     providers: [
       { id: "comma", label: "comma connect", url: "https://connect.comma.ai" },
       { id: "konik", label: "Konik", url: "https://stable.konik.ai" },
+      { id: "drive", label: "MarkenJaden Drive", url: "https://drive.markenjaden.de" },
       { id: "custom", label: "Custom", url: "https://cloud.example.test:8443" },
     ],
   }
@@ -47,11 +49,11 @@ test("validProviderStatus rejects missing custom entry or bad provider urls", ()
   assert.equal(validProviderStatus(twoOnly), false)
 
   const badCustomUrl = baseStatus()
-  badCustomUrl.providers[2].url = "http://insecure.example.test"
+  badCustomUrl.providers[3].url = "http://insecure.example.test"
   assert.equal(validProviderStatus(badCustomUrl), false)
 })
 
-test("connectRouteUrl validates comma, konik, and custom connect URLs", () => {
+test("connectRouteUrl validates comma, konik, drive, and custom connect URLs", () => {
   assert.equal(
     connectRouteUrl({
       routeId: "2026-10-01--12-00-00",
@@ -59,6 +61,15 @@ test("connectRouteUrl validates comma, konik, and custom connect URLs", () => {
       connectUrl: "https://connect.comma.ai/0123456789abcdef/2026-10-01--12-00-00",
     }),
     "https://connect.comma.ai/0123456789abcdef/2026-10-01--12-00-00",
+  )
+
+  assert.equal(
+    connectRouteUrl({
+      routeId: "2026-10-01--12-00-00",
+      provider: "drive",
+      connectUrl: "https://drive.markenjaden.de/0123456789abcdef/2026-10-01--12-00-00",
+    }),
+    "https://drive.markenjaden.de/0123456789abcdef/2026-10-01--12-00-00",
   )
 
   assert.equal(
