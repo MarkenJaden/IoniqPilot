@@ -22,8 +22,8 @@ jobs:
     uses: MarkenJaden/workflows/.github/workflows/upstream-sync.yml@main
     with:
       upstream_repo: 'StarPilotHQ/StarPilot'
-      upstream_branch: 'Dom'
-      target_branch: 'Dom'
+      upstream_branch: 'testing'
+      target_branch: 'testing'
       python_version: '3.12'
       submodules: 'false'
       workflow_sync_policy: 'preserve_if_no_pat'
