@@ -237,7 +237,9 @@ class _Canvas:
         self.view.map_layer = self._render_map
         from openpilot.starpilot.models.jetlink_status import JetlinkStatus
         from openpilot.starpilot.ui.onroad_jetlink import JetlinkStatusWidget
-        cast(JetlinkStatusWidget, self.view.jetlink_status).status = JetlinkStatus('iPhone', 'active', 24.6, 'connected')
+        cast(JetlinkStatusWidget, self.view.jetlink_status).status = JetlinkStatus('iPhone', 'active', 24.6, 'connected', model='Cinque v3')
+        from openpilot.starpilot.ui.network_signal import Signal
+        self.view.network_signal.preview = Signal(2, 4, 'wifi', 'LTE', 'connected', ('iPhone 15',), 'Home Wi-Fi')
       self.monitor = _DriverMonitorArt(profile)
       self.view.driver_monitor_layer = self._render_driver_monitor
       self.view.preview_pip_layer = self._render_preview_pip
@@ -250,8 +252,6 @@ class _Canvas:
 
   def _render_background(self, rect: rl.Rectangle, state: OnroadState) -> None:
     render_sample_road(rect, state, self.profile)
-    if not state.customization.get("widgetOrder", {}).get(str(self.profile)) and self.viewport is None:
-      self._render_side_cameras(state)
 
   @staticmethod
   def _map_placement(state: OnroadState):
@@ -265,9 +265,11 @@ class _Canvas:
       self.map.draw(rl.Rectangle(placed["x"] + shift, placed["y"], placed["width"], placed["height"]), placed["opacity"] / 100.0)
 
   def _render_preview_pip(self, rect, state, *, submit=None):
-    if submit is not None:
-      for key in CAMERA_WIDGETS:
-        submit(key, lambda key=key: self._render_side_cameras(state, only=key))
+    if submit is None:
+      self._render_side_cameras(state)
+      return
+    for key in CAMERA_WIDGETS:
+      submit(key, lambda key=key: self._render_side_cameras(state, only=key))
 
   def _render_side_cameras(self, state: OnroadState, only=None) -> None:
     for key in CAMERA_WIDGETS:
@@ -278,8 +280,9 @@ class _Canvas:
         continue
       widget = PROFILES[str(self.profile)]["widgets"][key]
       radius = widget["width"] / 2
-      center = rl.Vector2(position["x"] + radius, position["y"] + radius)
-      rl.draw_circle_v(center, radius, rl.Color(21, 44, 57, 230))
+      shift = state.viewport_width - 1860 if self.profile == Profile.LARGE and key == "pip_right" and self.viewport is None else 0
+      center = rl.Vector2(position["x"] + shift + radius, position["y"] + radius)
+      rl.draw_circle_v(center, radius, rl.Color(21, 44, 57, 90))
       rl.draw_ring(center, radius - 3, radius, 0, 360, 64, rl.Color(94, 229, 238, 255))
 
   def _render_driver_monitor(self, rect: rl.Rectangle, state: OnroadState, *, general: bool = False) -> None:
