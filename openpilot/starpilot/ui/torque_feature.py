@@ -64,8 +64,8 @@ class TorqueFeature:
       token = self._manual_token()
       current = self._manual_context()
       saved = None if profile is None else profile.manual_coordinates
-      matches = profile is None or (profile.basis == basis and profile.flm is None
-        and (saved is None or saved.context == current) and self._manual_compatible(saved))
+      matches = profile is None or (profile.basis == basis and not profile.active_legacy_flm
+        and (saved is None or saved.matches_context(current)) and self._manual_compatible(saved))
       values = dict(saved.values) if saved is not None else dict.fromkeys(NAMES, 0.)
       locked = () if saved is None else saved.locked
       accepted = () if saved is None else saved.automatic or ()
@@ -113,8 +113,8 @@ class TorqueFeature:
       return {**profiles, fingerprint: replace(prior, manual_coordinates=None)}
     current = self._manual_context()
     saved = prior.manual_coordinates
-    if (name not in NAMES or prior.basis != basis or prior.flm is not None
-        or saved is not None and (saved.context != current or not self._manual_compatible(saved))):
+    if (name not in NAMES or prior.basis != basis or prior.active_legacy_flm
+        or saved is not None and (not saved.matches_context(current) or not self._manual_compatible(saved))):
       raise ValueError("Manual tune context changed")
     values = dict(saved.values) if saved is not None else dict.fromkeys(NAMES, 0.)
     values[name] = float(request.value) / 100
@@ -163,6 +163,16 @@ class TorqueFeature:
   def rows(self, capability: tuple | None, allowed: bool, *, repair_allowed: bool | None = None) -> tuple[bool, tuple[FeatureRow, ...]]:
     repair_allowed = allowed if repair_allowed is None else repair_allowed
     raw = self._raw(DOCUMENT_KEY)
+    from openpilot.starpilot.lateral.gain_runtime import gain_supported
+    cp = self.owner.vehicle_params()
+    gain_available = capability is not None and cp is not None and gain_supported(cp)
+    if gain_available and capability is not None and capability[3] == "pid":
+      from openpilot.starpilot.ui.gain_feature import GainFeature
+      try:
+        profiles = {} if raw is None else parse_document(raw)
+      except (ValueError, UnicodeError, OverflowError):
+        return False, (FeatureRow("", "Steering response", "Invalid saved tuning document"),)
+      return True, GainFeature(self.owner).rows(capability, profiles, raw, repair_allowed, repair_allowed)
     bolt = capability is not None and capability[0] in BOLT_VEHICLES
     try:
       if capability is None:
@@ -237,9 +247,10 @@ class TorqueFeature:
     if bolt:
       rows.insert(0, FeatureRow("", "Manual friction", "Compensates steering friction. First manual activation requires " +
                                "a driving-process restart; an active tuning owner refreshes changes during the drive."))
-    if fingerprint in GM_VEHICLES:
+    if gain_available:
       from openpilot.starpilot.ui.gain_feature import GainFeature
-      rows.extend(GainFeature(self.owner).rows(capability, profiles, raw, allowed, repair_allowed))
+      rows.extend(GainFeature(self.owner).rows(
+        capability, profiles, raw, allowed if fingerprint in GM_VEHICLES else repair_allowed, repair_allowed))
     rows.extend(self._geometry_rows(capability, profiles, raw, allowed))
     return True, tuple(rows)
 
