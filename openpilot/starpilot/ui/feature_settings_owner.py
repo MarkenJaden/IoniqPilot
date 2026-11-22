@@ -622,8 +622,7 @@ class FeatureSettingsOwner:
     return value, value is not None and 0.0 <= value <= 100.0, canonical, legacy
 
   def _read_saved(self, key: str, limit: int) -> tuple[bytes | None, bool]:
-    # One assembly observes one complete source per key. Actions and the next
-    # assembly always read the filesystem again, including unreadable sources.
+    # Cache source reads only within each snapshot.
     reads = self._snapshot_reads.get()
     def read():
       try:
@@ -1130,6 +1129,9 @@ class FeatureSettingsOwner:
       rows.extend(longitudinal_developer_rows(self))
     elif page == FeaturePage.DEVELOPER_LATERAL:
       title = 'Developer Parameters'
+      controller_row = self.controller.row()
+      if controller_row is not None:
+        rows.append(controller_row)
       capability = self._capability("torque") or self._capability("gain")
       allowed = configurable and self.authority("torque") and capability is not None
       _, numeric_rows = self.torque.rows(capability, allowed, repair_allowed=parked and allowed)
@@ -1185,9 +1187,9 @@ class FeatureSettingsOwner:
         rows.extend(self._cruise_rows(configurable))
       rows.extend(self.wheel.rows())
     elif page == FeaturePage.SLC:
-      from opendbc.car.hyundai.software_cruise import selected as button_cruise_selected
       cp = self.vehicle_params()
-      slc_available = system_long if cp is None else self.longitudinal_available() or button_cruise_selected(cp)
+      button_cruise = hyundai_software_cruise.slc_configurable(cp, self.params)
+      slc_available = system_long if cp is None else self.longitudinal_available() or button_cruise
       system_long = slc_available and self.authority("slc")
       allowed = configurable and system_long
       offsets_ready, offset_rows = self.slc_offsets.rows(allowed, repair_allowed=parked and allowed)
@@ -1207,10 +1209,10 @@ class FeatureSettingsOwner:
       control_row = self._bool_row("SpeedLimitController", "Speed Limit Controller",
                                    allowed and (offsets_ready or control == "1"), reason=control_reason)
       rows.append(replace(control_row, reason=control_reason) if control_row.choices else control_row)
-      cp = self.vehicle_params()
-      if cp is not None and not cp.pcmCruise:
+      if cp is not None and (not cp.pcmCruise or button_cruise):
         rows.append(self._bool_row("SLCOnEngage", "Match Speed Limit on Engage", allowed and control == "1",
-                                   reason="Start SET at the SLC limit plus offset. RES restores your previous SET"))
+                                   reason="Lower your new SET to the speed limit plus offset when using Redneck Cruise"
+                                   if button_cruise else "Start SET at the SLC limit plus offset. RES restores your previous SET"))
       rows.append(self._bool_row("ShowSpeedLimits", "Show speed limit signs", self.authority("preferences"),
                                  reason="Display signs independently of Speed Limit Controller; does not change cruise speed"))
       rows.append(self._bool_row("UseVienna", "Vienna Signs", self.authority("preferences"),
@@ -1438,8 +1440,7 @@ class FeatureSettingsOwner:
   def apply(self, request: FeatureSettingsRequest, *, reset_default: bool = False) -> bool:
     if reset_default and not self.authority("parked_preferences"):
       return False
-    # A request may arrive through a callback during assembly. Its compare and
-    # authorization checks must still observe current sources independently.
+    # Recheck live sources even from snapshot callbacks.
     token = self._snapshot_reads.set(None)
     vehicle_token = self._snapshot_vehicle.set(None)
     try:
@@ -1770,7 +1771,8 @@ class FeatureSettingsOwner:
           return False
         if key in ("SLCOnEngage", WHEEL_OVERRIDE_KEY):
           cp = self.vehicle_params()
-          if cp is None or cp.pcmCruise or not self.longitudinal_available() or (
+          button_match = key == "SLCOnEngage" and hyundai_software_cruise.slc_configurable(cp, self.params)
+          if (not (button_match or cp is not None and not cp.pcmCruise and self.longitudinal_available()) or
               request.value == "On" and self._raw("SpeedLimitController") != b"1"):
             return False
         encoded = "1" if request.value == "On" else "0"
