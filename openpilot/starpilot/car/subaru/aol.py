@@ -1,9 +1,19 @@
 """Subaru physical cruise intent with independent lateral authority."""
 from opendbc.car import structs
 from opendbc.car.subaru.stock_aol import IMPREZA_MAIN_AOL, qualified, temporary_restriction
-from opendbc.car.subaru.values import CAR
+from opendbc.car.subaru.values import CAR, EARLY_GLOBAL_TORQUE_CARS, SubaruSafetyFlags
 from openpilot.starpilot.aol.intent import AolCardIntent
 from openpilot.starpilot.aol.policy import AolVehiclePolicy
+
+
+def known_paddle_pause(cp, state, samples=()):
+  gears = structs.CarState.GearShifter
+  if cp.carFingerprint != CAR.SUBARU_IMPREZA_2020:
+    return False
+  states = [state, *(sample for sample, _ in samples)]
+  return (all(valid for _, valid in samples) and any(sample.gearShifter == gears.manumatic for sample in states) and
+          all(sample.canValid and not sample.canTimeout and sample.gearShifter in (gears.drive, gears.manumatic)
+              for sample in states) and qualified(cp, marked_only=True))
 
 
 def _drive_gear(cp, state):
@@ -27,6 +37,10 @@ class SubaruStockCardIntent(AolCardIntent):
     self._pending_main_restriction_ns = 0
     self._deferred_park_main = False
     self.main_arm_ns = 0
+
+  def output(self, CS):
+    allowed, pause_lateral, pause_longitudinal = super().output(CS)
+    return allowed and (self.allow_manumatic or CS.gearShifter != structs.CarState.GearShifter.manumatic), pause_lateral, pause_longitudinal
 
   def observe_startup_readiness(self, sm, CS, *, now_ns, **kwargs):
     if self.main_arm:
@@ -100,7 +114,8 @@ def policy_for(cp):
 
 def native_profile_supported(model, param):
   return model == int(structs.CarParams.SafetyModel.subaru) and param in (
-    0, 1, 8, 16, 17, 145, 177, 209, 401, 465, 512, 520, 1169, 1425, 2225, 4096, 4104, 4608, 4616)
+    0, 1, 8, 16, 17, 145, 177, 209, 401, 465, 512, 520, 1169, 1425, 2225, 4096, 4104, 4608, 4616,
+    SubaruSafetyFlags.EARLY_GLOBAL_TORQUE, SubaruSafetyFlags.EARLY_GLOBAL_TORQUE | 8)
 
 
 def native_accepts_cp(cp, model, param):
@@ -122,7 +137,7 @@ def ordinary_axis_request_allowed(cp, state):
 
 def create_intent(cp, settings):
   main_arm = (cp.carFingerprint in (CAR.SUBARU_CROSSTREK_2025, CAR.SUBARU_IMPREZA_2025) or
-              (cp.carFingerprint in (CAR.SUBARU_IMPREZA_2020, CAR.SUBARU_LEGACY_2025, CAR.SUBARU_OUTBACK_2023) and qualified(cp)))
+              (cp.carFingerprint in EARLY_GLOBAL_TORQUE_CARS | {CAR.SUBARU_IMPREZA_2020, CAR.SUBARU_LEGACY_2025, CAR.SUBARU_OUTBACK_2023} and qualified(cp)))
   return SubaruStockCardIntent(settings, main_arm=main_arm,
                                allow_manumatic=(cp.carFingerprint == CAR.SUBARU_LEGACY_2025))
 

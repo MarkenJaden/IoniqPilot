@@ -37,6 +37,8 @@ class CarControllerParams:
       self.STEER_MAX = 1000
       self.STEER_DELTA_UP = 40
       self.STEER_DELTA_DOWN = 40
+    elif CP.carFingerprint in EARLY_GLOBAL_TORQUE_CARS:
+      self.STEER_MAX = 3071
     elif CP.carFingerprint == CAR.SUBARU_IMPREZA_2020:
       self.STEER_DELTA_UP = 35
       self.STEER_MAX = 1439
@@ -71,6 +73,7 @@ class SubaruSafetyFlags(IntFlag):
   GEN2 = 1
   LONG = 2
   PREGLOBAL_REVERSED_DRIVER_TORQUE = 4
+  EARLY_GLOBAL_TORQUE = 8192
   PREGLOBAL_OUTBACK_STOCK_ACC = 8
   LKAS_ANGLE = 16
   D_PLATFORM = 64
@@ -168,6 +171,11 @@ class CAR(Platforms):
   SUBARU_IMPREZA = SubaruPlatformConfig(
     [
       SubaruCarDocs("Subaru Impreza 2017-19"),
+    ],
+    CarSpecs(mass=1568, wheelbase=2.67, steerRatio=15),
+  )
+  SUBARU_CROSSTREK_2018 = SubaruPlatformConfig(
+    [
       SubaruCarDocs("Subaru Crosstrek 2018-19", video="https://youtu.be/Agww7oE1k-s?t=26"),
       SubaruCarDocs("Subaru XV 2018-19", video="https://youtu.be/Agww7oE1k-s?t=26"),
     ],
@@ -268,6 +276,9 @@ SUBARU_ALT_VERSION_REQUEST = bytes([uds.SERVICE_TYPE.READ_DATA_BY_IDENTIFIER]) +
   p16(0xf100)
 SUBARU_ALT_VERSION_RESPONSE = bytes([uds.SERVICE_TYPE.READ_DATA_BY_IDENTIFIER + 0x40]) + \
   p16(0xf100)
+
+EARLY_GLOBAL_TORQUE_CARS = frozenset((CAR.SUBARU_IMPREZA, CAR.SUBARU_CROSSTREK_2018))
+
 
 FW_QUERY_CONFIG = FwQueryConfig(
   validate_fw_match=validate_fw_match,

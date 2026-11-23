@@ -273,7 +273,8 @@ class TransportPauseFeedback:
     # Cancel needs acknowledged LAT, original deadlines and a fresh withdrawal event.
     ford_cancel_health = bool(ford_withdrawal and not cs.cruiseState.enabled and
       not axis.desiredLongitudinal and not axis.longitudinalActive and
-      0 < event_ns <= now_ns and now_ns - event_ns <= AXIS_MAX_AGE_NS and
+      0 < event_ns <= now_ns and (now_ns - event_ns <= AXIS_MAX_AGE_NS or
+        native is not None and native.observedMonoTime < event_ns == axis.faultEventMonoTime <= axis.observedMonoTime) and
       any(event.userDisable and event.name in (log.OnroadEvent.EventName.buttonCancel,
         log.OnroadEvent.EventName.pcmDisable) for event in sm['onroadEvents']) and
       0 < int(sm.logMonoTime['pandaStates']) <= now_ns and
@@ -1128,6 +1129,7 @@ class TransportPauseFeedback:
 
   def _inactive_gear_source_gap(self, sm, cp, cs, axis, stamp, now_ns, *, latched, producer):
     from opendbc.car import structs
+    from openpilot.starpilot.car.subaru.aol import known_paddle_pause
     previous = self.signature
     if (not latched or self.failed or self.paused or self.pending_event or self.retention_started_ns or
       self.source_retention_started_ns or not self.ever_lateral_active or previous is None or
@@ -1136,7 +1138,8 @@ class TransportPauseFeedback:
       not producer or previous[14] != producer or
       not 0 < previous[8] <= previous[2] <= self.healthy_feedback_ns <= now_ns or
       now_ns - previous[8] > SAFETY_MAX_AGE_NS or
-      cs.gearShifter not in (structs.CarState.GearShifter.reverse, structs.CarState.GearShifter.neutral) or
+      (cs.gearShifter not in (structs.CarState.GearShifter.reverse, structs.CarState.GearShifter.neutral) and
+       not known_paddle_pause(cp, cs)) or
       not cs.canValid or cs.canTimeout or cs.steerFaultTemporary or cs.steerFaultPermanent or
       cs.accFaulted or cs.vehicleSensorsInvalid or cs.doorOpen or cs.seatbeltUnlatched or
       cs.steeringDisengage or not cs.cruiseState.available or cs.buttonEvents or
