@@ -153,7 +153,8 @@ def _policy_for(CP) -> AolVehiclePolicy:
     )
   if qualified_canfd_long(CP):
     return AolVehiclePolicy(intent_supported=True, settings_supported=True, runtime_supported=True,
-                            normal_runtime_supported=True, explicit_latch=True, safety_param_addition=0x0800,
+                            normal_runtime_supported=True, explicit_latch=True,
+                            safety_param_addition=0x0800,
                             alternative_experience_addition=32)
   if qualified_canfd_stock(CP):
     return AolVehiclePolicy(

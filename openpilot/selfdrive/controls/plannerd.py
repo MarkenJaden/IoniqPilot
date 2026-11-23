@@ -325,7 +325,21 @@ def starpilot_main():
 
   ldw = LaneDepartureWarning()
   from openpilot.starpilot.longitudinal.developer_tuning import read_tuning
-  longitudinal_planner = LongitudinalPlanner(CP, developer_tuning=read_tuning(params, CP))
+  from openpilot.starpilot.longitudinal.downhill_coast import read_surplus
+  from openpilot.starpilot.navigation.slowdown import DEFAULT_SLOWDOWN_PERCENT
+  navigation_slowdown_percent = DEFAULT_SLOWDOWN_PERCENT
+  if CP.openpilotLongitudinalControl and not CP.passive and not CP.dashcamOnly:
+    from openpilot.starpilot.navigation.owner import NavigationOwner
+    try:
+      navigation_slowdown_percent = NavigationOwner().read()['turnSlowdownPercent']
+    except (OSError, ValueError):
+      pass
+  downhill_available = CP.openpilotLongitudinalControl and not (CP.passive or CP.dashcamOnly or CP.notCar)
+  longitudinal_planner = LongitudinalPlanner(CP, developer_tuning=read_tuning(params, CP),
+                                             navigation_slowdown_percent=navigation_slowdown_percent)
+  downhill_request_ns = -1_000_000_000
+  if downhill_available and 'REPLAY' in os.environ:
+    longitudinal_planner.downhill_surplus_mps = read_surplus(params)
   nudge_preferences = NudgePreferences(params)
   # Saved-on features start only for a finalized, supported driving owner. Their
   # current-source and longitudinal authority checks still run every frame.
@@ -389,6 +403,9 @@ def starpilot_main():
   subscribed_services.extend(optional_slc)
   subscribed_services.append('starpilotNavigation')
   optional_conditional = ['starpilotNavigation'] + (['starpilotRadarState'] if conditional_host is not None else []) + optional_slc
+  if downhill_available:
+    subscribed_services.append('deviceMotion')
+    optional_conditional.append('deviceMotion')
   sm = messaging.SubMaster(subscribed_services, poll='modelV2',
                            ignore_alive=optional_conditional, ignore_valid=optional_conditional,
                            ignore_avg_freq=optional_conditional)
@@ -401,7 +418,11 @@ def starpilot_main():
         # Due saved-setting verification can block on Params. Complete it
         # before acquiring the model and fast-source batch, not after that
         # batch has already begun aging toward the CEM freshness deadline.
-        slc_lifecycle.refresh(time.monotonic_ns(), pending_actions=pending_slc_actions, pending_cruise=pending_slc_cruise)
+        settings_now_ns = time.monotonic_ns()
+        slc_lifecycle.refresh(settings_now_ns, pending_actions=pending_slc_actions, pending_cruise=pending_slc_cruise)
+        if downhill_available and not 0 <= settings_now_ns - downhill_request_ns < 1_000_000_000:
+          downhill_request_ns = settings_now_ns
+          longitudinal_planner.downhill_surplus_mps = read_surplus(params)
       sm.update()
       if sm.updated['modelV2']:
         # Only explicit replay uses the recorded model timeline. In a live host,

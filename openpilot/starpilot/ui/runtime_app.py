@@ -81,7 +81,7 @@ from openpilot.starpilot.ui.onroad_favorites import OnroadFavorites
 from openpilot.starpilot.ui.onroad_dm import DriverMonitorLayer
 from openpilot.starpilot.favorites.owner import FavoritesOwner
 from openpilot.starpilot.controllers.cruise_action import CruiseActionPublisher, ui_authority as cruise_action_authority
-from openpilot.starpilot.controllers.wheel_actions import WheelConsumer
+from openpilot.starpilot.controllers.wheel_actions import SCREEN_OFF_ACTION, WheelConsumer
 from openpilot.starpilot.ui.wheel_input import onroad_action_context
 from openpilot.starpilot.system.starport.projection_bookmark import BookmarkReceiver
 from openpilot.starpilot.system.starport.projection_slc_action import SlcActionReceiver
@@ -613,6 +613,8 @@ class StarShellSession:
           slot = self.favorites_owner.snapshot().slots[command.action - 11]
           if slot.available and slot.request is not None:
             self.favorites_owner.invoke(slot.request)
+        elif command.action == SCREEN_OFF_ACTION:
+          native_device.toggle_screen_off()
       except (OSError, RuntimeError, ValueError, TypeError):
         pass
 
@@ -946,7 +948,14 @@ class StarShellSession:
     try:
       if self.model_source is None:
         self.model_source = ModelStatusSource(self.adapter.ui_state.params)
-      return model_page(self.model_source.snapshot(), self.model_manager_snapshot(), getattr(self, "model_page", "models"),
+      status = self.model_source.snapshot()
+    except Exception as error:
+      if getattr(self, "_model_status_error", None) != repr(error):
+        self._model_status_error = repr(error)
+        cloudlog.exception("Driving model runtime status unavailable")
+      status = project_status(None, None, None, None, time.monotonic_ns())
+    try:
+      return model_page(status, self.model_manager_snapshot(), getattr(self, "model_page", "models"),
                         getattr(self, "model_filter", "installed"), getattr(self, "model_sort", "date"),
                         getattr(self, "model_size", "all"))
     except Exception as error:
@@ -954,7 +963,7 @@ class StarShellSession:
       if getattr(self, "_model_error", None) != repr(error):
         self._model_error = repr(error)
         cloudlog.exception("Driving Model page unavailable")
-      return model_page(project_status(None, None, None, None, time.monotonic_ns()))
+      return model_page(status)
 
   def _model_manager(self):
     if getattr(self, 'model_manager', None) is None:
@@ -1001,6 +1010,21 @@ class StarShellSession:
       self.model_scroll = feature_scroll(self.model_scroll, action.direction, len(state.rows), feature_page_rows(state))
     elif action.kind == "toolbar":
       self._model_option(action.direction)
+    elif action.kind == "action" and row is not None:
+      index = action.direction
+      current = next((candidate for candidate in state.rows if candidate.key == row.key), None)
+      # Catalog metadata can refresh during a tap. Recheck the model and pressed button, not its descriptive text.
+      if (current is None or not current.available or not 0 <= index < min(len(row.actions), len(current.actions)) or
+          not row.actions[index][1] or current.actions[index] != row.actions[index]):
+        self._unavailable("model list changed; try again")
+      elif row.key == "models:active" and index in (0, 1):
+        self._model_open(("models:pick:small", "models:pick:big")[index])
+      else:
+        intent = model_row_intent(self.model_manager_snapshot(fresh=True), self.model_page, row.key, index)
+        if intent is None or intent[0] != row.actions[index][0]:
+          self._unavailable("model list changed; try again")
+        else:
+          self._model_do(*intent[1:])
     elif row is None or row not in state.rows:
       if action.kind == "details" and row is None:
         self._feature_details("models", action)
@@ -1010,15 +1034,6 @@ class StarShellSession:
       self._feature_details("models", action)
     elif row.key == "models:randomizer" and action.kind == "change":
       self._model_do("randomizer")
-    elif row.key == "models:active" and action.kind == "action" and action.direction in (0, 1):
-      self._model_open(("models:pick:small", "models:pick:big")[action.direction])
-    elif action.kind == "action":
-      intent = model_row_intent(self.model_manager_snapshot(fresh=True), self.model_page, row.key, action.direction)
-      # A refreshed button that now means something else must not act on the displayed press.
-      if intent is None or action.direction >= len(row.actions) or intent[0] != row.actions[action.direction][0]:
-        self._unavailable("model list changed; try again")
-      else:
-        self._model_do(*intent[1:])
     self._snapshot_cache = None
 
   def _model_option(self, index: int) -> None:

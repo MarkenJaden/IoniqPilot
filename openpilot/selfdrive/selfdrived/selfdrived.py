@@ -264,10 +264,7 @@ class SelfdriveD:
     # Observational only. Do not cache this qualification for authority decisions.
 
     # Determine startup event
-    official_starpilot = (build_metadata.openpilot.git_normalized_origin.lower() == 'github.com/starpilothq/starpilot' and
-                          build_metadata.channel in ('stable', 'testing'))
-    standard_startup = official_starpilot or (build_metadata.openpilot.comma_remote and build_metadata.tested_channel)
-    self.startup_event = EventName.startup if standard_startup else EventName.startupMaster
+    self.startup_event = EventName.startup if build_metadata.standard_startup else EventName.startupMaster
     if HARDWARE.get_device_type() == 'mici':
       self.startup_event = None
     if not car_recognized:
@@ -901,9 +898,9 @@ class SelfdriveD:
             qualified_toyota(self.CP, marked_only=True) or qualified_mazda(self.CP, marked_only=True) or
             self.ford_source_deadline_supported())
 
-  def held_axis_override_wait(self, CS, proof, now_ns, *, fresh_successor=False):
+  def held_axis_override_wait(self, CS, proof, now_ns, *, fresh_successor=False, fresh_mqb_brake=False):
     """Recognize an already applied override; never admit a new physical edge."""
-    if (proof is None or not (qualified_ioniq6(self.CP) or qualified_gm(self.CP) or
+    if (proof is None or not (fresh_mqb_brake or qualified_ioniq6(self.CP) or qualified_gm(self.CP) or
         (self.CP.brand == 'hyundai' and self.source_deadline_deferral_supported()) or
         self.ford_source_deadline_supported()) or not self.sm.seen['carControl'] or
         not self.sm.valid['carControl'] or self.sm['carControl'].longActive or
@@ -920,7 +917,9 @@ class SelfdriveD:
     held_brake = bool(proof[8] and not proof[9] and not self.enabled and not self.active and
       (previous.brakePressed or previous.regenBraking) and
       all(valid and sample.brakePressed == previous.brakePressed and sample.regenBraking == previous.regenBraking
-          and not sample.gasPressed and not sample.buttonEvents for sample, valid in samples))
+          and not sample.gasPressed and not sample.buttonEvents
+          and (not fresh_mqb_brake or sample.canValid and not sample.canTimeout and
+               not sample.steerFaultTemporary and not sample.steerFaultPermanent) for sample, valid in samples))
     ford_lateral_gas = bool(self.ford_source_deadline_supported() and proof[8] and not proof[9] and
       (not self.enabled and not self.active and not CS.cruiseState.enabled or
        self.enabled and self.active and CS.cruiseState.enabled and proof[7]))
@@ -1310,6 +1309,12 @@ class SelfdriveD:
     else:
       # Retire only this presentation; retain every original safety alert.
       self.AM.alerts.pop('aolAvailability/warning', None)
+    if self.aol_axis_decision.aol_speed_paused and ET.WARNING not in self.state_machine.current_alert_types:
+      # Preserve the existing speed warning duration even when only AOL was on.
+      speed_alert = copy(self.events.event_rules[EventName.speedTooHigh][ET.WARNING])
+      speed_alert.alert_type = 'speedTooHigh/warning'
+      speed_alert.event_type = 'aolSpeedPause'
+      alerts.append(speed_alert)
     if getattr(self, 'jetlink_link_lost', False):
       alerts.append(jetlink_lost_alert())
     if (self.CP.brand == 'ford' or getattr(self, 'hkg_angle_steering', False)) and CS.steeringPressed:
@@ -1610,6 +1615,12 @@ class SelfdriveD:
           previous=decision, source_ns=source_ns, now_ns=now_ns, axis_session_id=self.aol_session_id,
           cancel_samples=getattr(self, 'car_state_envelopes', ())):
         user_disable = any(event.userDisable and event.name != EventName.buttonCancel for event in self.events.to_msg())
+    if user_disable and fresh_successor and decision.lateral_active and not decision.longitudinal_active and self.CP.brand == 'mazda':
+      from openpilot.starpilot.car.mazda.aol import physical_cancel_lateral_allowed
+      native = current_native(self.sm, self.CP, now_ns=now_ns, axis_session_id=self.aol_session_id)
+      if physical_cancel_lateral_allowed(self.CP, CS, intent, native, settings=self.aol_settings,
+          previous=decision, source_ns=source_ns, now_ns=now_ns, axis_session_id=self.aol_session_id):
+        user_disable = any(event.userDisable and event.name != EventName.buttonCancel for event in self.events.to_msg())
     if user_disable and fresh_successor and self.ford_source_deadline_supported():
       from openpilot.starpilot.car.ford.aol import physical_cancel_lateral_allowed
       native = current_native(self.sm, self.CP, now_ns=now_ns, axis_session_id=self.aol_session_id)
@@ -1617,8 +1628,16 @@ class SelfdriveD:
           previous=decision, source_ns=source_ns, now_ns=now_ns, axis_session_id=self.aol_session_id, allow_brake=True):
         user_disable = any(event.userDisable and event.name not in
           (EventName.buttonCancel, EventName.pcmDisable, EventName.pedalPressed) for event in self.events.to_msg())
+    fresh_mqb_brake = False
+    if (user_disable and fresh_successor and self.CP.brand == 'volkswagen' and
+        decision.desired_lateral and not decision.desired_longitudinal and not decision.longitudinal_active and
+        intent.allowedLatch and intent.lateralArmed and not intent.pauseLateral and CS.brakePressed):
+      from opendbc.car.volkswagen.long_aol import qualified as mqb_long_qualified
+      from opendbc.car.volkswagen.stock_aol import qualified as mqb_stock_qualified
+      fresh_mqb_brake = mqb_long_qualified(self.CP, marked_only=True) or mqb_stock_qualified(self.CP, marked_only=True)
     held_brake, held_gas = self.held_axis_override_wait(CS, proof, now_ns,
-      fresh_successor=fresh_successor and (qualified_gm(self.CP) or self.ford_source_deadline_supported()))
+      fresh_successor=fresh_successor and (qualified_gm(self.CP) or self.ford_source_deadline_supported()),
+      fresh_mqb_brake=fresh_mqb_brake)
     if user_disable and (held_brake or self.ford_source_deadline_supported() and held_gas):
       # A fresh same-owner source can establish its own LAT permission after
       # an old output expires. Held-brake continuity does not renew that output;
@@ -1929,6 +1948,9 @@ class SelfdriveD:
     pause_brake_mps = self.aol_settings.pause_brake_mps if self.aol_settings is not None else 0.0
     if gear_pause:
       lateral_events = [event for event in lateral_events if event not in (EventName.wrongGear, EventName.reverseGear)]
+    speed_limited = EventName.speedTooHigh in lateral_events
+    if speed_limited:
+      lateral_events.remove(EventName.speedTooHigh)
     below_entry_speed = EventName.belowEngageSpeed in lateral_events
     honda_below_entry_speed = below_entry_speed and honda_below_engage_lateral_allowed(
       self.CP, CS, intent, previously_active=getattr(self, 'aol_ever_active', False))
@@ -1941,7 +1963,7 @@ class SelfdriveD:
        is_ordinary_ascm_profile(self.CP, longitudinal=True) or
        is_ordinary_sdgm_profile(self.CP, longitudinal=True) or
        (self.CP.carFingerprint in (GM_CAR.BUICK_LACROSSE, GM_CAR.CHEVROLET_SUBURBAN) and qualified_gm(self.CP))))
-    return decide_axes(
+    decision = decide_axes(
       standard_lateral=self.active, standard_longitudinal=bool(self.enabled and self.CP.openpilotLongitudinalControl and
         not honda_below_entry_speed and
         not raw_longitudinal_withdrawal(self.CP, CS, self.sm, native, session=self.aol_session_id, now_ns=now_ns) and
@@ -1999,6 +2021,17 @@ class SelfdriveD:
         sample.steerFaultTemporary or pause_brake_mps > 0 and sample.brakePressed and not sample.standstill and
         sample.vEgo < pause_brake_mps
         for sample, _ in getattr(self, 'car_state_samples', ())))
+    if not speed_limited:
+      return decision
+    # Withdraw both requests at the existing ceiling. Keep only the already
+    # established driver's latch while the normal health and entry gates pass.
+    previous = self.aol_axis_decision
+    if (decision.native_acknowledged and decision.desired_lateral and
+        (previous.lateral_active or previous.aol_speed_paused) and
+        intent.allowedLatch and intent.lateralArmed and not self.events.contains(ET.USER_DISABLE) and
+        healthy_transport(self.sm, self.CP, CS, self.aol_session_id, now_ns, native)):
+      return AxisDecision(native_acknowledged=True, aol_speed_paused=True)
+    return AxisDecision()
 
   def cold_volkswagen_main_readiness(self, CS, intent, now_ns):
     from opendbc.car.volkswagen.long_aol import qualified as volkswagen_long_qualified
@@ -2470,7 +2503,8 @@ class SelfdriveD:
       elif getattr(self, 'aol_availability_long_inhibit', False):
         decision = self.aol_axis_decision
         self.aol_axis_decision = AxisDecision(desired_lateral=decision.desired_lateral,
-          lateral_active=decision.lateral_active, native_acknowledged=decision.native_acknowledged)
+          lateral_active=decision.lateral_active, native_acknowledged=decision.native_acknowledged,
+          aol_speed_paused=decision.aol_speed_paused)
       if pause:
         # Negotiate the fresh lateral request while output and ordinary LONG
         # remain off; requiring an active ack before requesting would deadlock.
