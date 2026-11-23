@@ -97,9 +97,9 @@ DESCRIPTIONS = {
                              'Existing adoption and confirmation settings still apply.'),
   'SLCAdvanceLowerSeconds': ('Offers lower mapped limits early using road distance and current speed. ' +
                             'Existing adoption and confirmation settings still apply.'),
-  'SLCPriority1': 'Chooses the first source checked for a fresh speed limit.',
-  'SLCPriority2': 'Chooses the source used when the primary source has no fresh speed limit.',
-  'SLCPriority3': 'Chooses an optional third source when neither earlier source has a fresh speed limit.',
+  'SLCPriority1': "Chooses where SLC gets speed limits. SLC always uses the newest limit from any source. If two arrive at the same time, this one wins.",
+  'SLCPriority2': "Chooses a second place SLC gets speed limits. Its new limits are used just like the primary source's. Choose Off to stop using it.",
+  'SLCPriority3': "Chooses an optional third place SLC gets speed limits. Its new limits are used like the others. Choose Off to stop using it.",
   'slc_pref:cluster_effective_speed': 'Displays the currently active SLC-limited or overridden speed (e.g. 50 / 100 / 120) on your car instrument cluster while preserving your max SET speed.',
   'slc_pref:step_override_enabled': 'When SLC caps below your max SET speed, + and − step directly up or down from the active speed limit until the next limit change or Cancel + SET.',
   'slc_pref:unlimited_recognition': 'Recognizes unlimited Autobahn sections (Zeichen 282) from OSM motorway tags and/or dashboard camera signs so stale limits are cleared immediately.',
