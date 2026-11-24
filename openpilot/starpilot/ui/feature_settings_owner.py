@@ -27,7 +27,7 @@ from openpilot.starpilot.longitudinal.profile_runtime import TRAFFIC_CRUISE_BRAK
 from openpilot.starpilot.longitudinal.lead_approach_runtime import KEY as LEAD_APPROACH_KEY
 from openpilot.starpilot.longitudinal.lead_takeoff_preferences import KEY as LEAD_TAKEOFF_KEY
 from openpilot.starpilot.longitudinal.encouragement import KEY as NUDGE_KEY
-from openpilot.starpilot.longitudinal.downhill_coast import KEY as DOWNHILL_KEY, SURPLUS_KEY, MAX_SURPLUS_MPH
+from openpilot.starpilot.longitudinal.downhill_coast import KEY as DOWNHILL_KEY, SURPLUS_KEY
 from openpilot.selfdrive.car.cruise import LOW_SPEED_CRUISE_ON_SET
 from openpilot.starpilot.longitudinal.planner_selection import KEY as PLANNER_SELECTION_KEY, save_selection
 
@@ -37,6 +37,9 @@ from openpilot.starpilot.longitudinal.profile_document import (
   personality_reference_curves, serialize_personality_profiles,
   synchronise_profile_document_enabled,
 )
+from openpilot.starpilot.ui.feature_defaults import (AGGRESSIVE_COOLING_DESCRIPTION as AGGRESSIVE_COOLING_DESCRIPTION,
+                                                  AGGRESSIVE_COOLING_KEY as AGGRESSIVE_COOLING_KEY,
+                                                  BOOL_DEFAULTS as BOOL_DEFAULTS, FLOAT_SPECS as FLOAT_SPECS)
 from openpilot.starpilot.ui.feature_settings_state import (
   FeaturePage, FeatureRow, FeatureSettingsRequest, FeatureSettingsState, SLC_CONFIRM_ACTIONS, SLC_OFFSET_KEYS, TORQUE_CONFIRM_ACTIONS,
 )
@@ -63,10 +66,10 @@ from openpilot.starpilot.ui.traffic_feature import TrafficFeature, EDIT_KEYS as 
 from openpilot.starpilot.ui.lane_change_feature import LaneChangeFeature, KEYS as LANE_CHANGE_KEYS
 from openpilot.starpilot.ui.conditional_feature import BUTTON_PREFIX, ConditionalFeature
 from openpilot.starpilot.saved_source import read_saved
-from openpilot.starpilot.ui.wheel_feature import WheelFeature, PREFIX as WHEEL_PREFIX
+from openpilot.starpilot.ui.wheel_feature import PREFIX as WHEEL_PREFIX
 from openpilot.starpilot.longitudinal.output_max import KEY as OUTPUT_MAX_KEY
 from openpilot.starpilot.ui.tesla_coop_feature import TeslaCoopFeature
-from openpilot.starpilot.ui.tesla_screen_feature import TeslaScreenFeature, KEYS as TESLA_SCREEN_KEYS
+from openpilot.starpilot.ui.tesla_rows import TeslaVehicleRows, TeslaWheelRows, KEYS as TESLA_SCREEN_KEYS
 from openpilot.starpilot.ui.ford_bluepilot_feature import FordBluePilotFeature, KEYS as FORD_BLUEPILOT_KEYS
 from openpilot.starpilot.ui.ford_cluster_feature import FordClusterFeature
 from openpilot.starpilot.ui.ford_rear_fog_feature import FordRearFogFeature
@@ -89,9 +92,6 @@ from openpilot.starpilot.curve_speed.actions import ACTION_KEYS as CURVE_ACTION_
 from openpilot.starpilot.controllers.toyota_cruise import capability as toyota_cruise_capability
 
 
-AGGRESSIVE_COOLING_KEY = "AggressiveCoolingEnabled"
-AGGRESSIVE_COOLING_DESCRIPTION = ("Runs the fan sooner and harder to keep the comma 10-16 °C (18-29 °F) cooler on hot days, " +
-                                  "at the cost of more fan noise. Applies next drive.")
 GLOBAL_BOOL_PREFERENCES = frozenset((LEAD_APPROACH_KEY, LEAD_TAKEOFF_KEY, NUDGE_KEY, LOW_SPEED_CRUISE_ON_SET,
                                      "DisengageOnAccelerator", AGGRESSIVE_COOLING_KEY))
 
@@ -190,7 +190,7 @@ class FeatureSettingsOwner:
                                       repair_parked=lambda: self.authority("parked_preferences"),
                                       configuration_longitudinal=self.configuration_longitudinal)
     self.long_profiles = LongProfileFeature(self)
-    self.tesla_screen = TeslaScreenFeature(self)
+    self.tesla_screen = TeslaVehicleRows(self)
     self.tesla_coop = TeslaCoopFeature(self)
     from openpilot.starpilot.ui.gm_cancel_remap_feature import GmCancelRemapFeature
     self.gm_cancel_remap = GmCancelRemapFeature(self)
@@ -207,7 +207,7 @@ class FeatureSettingsOwner:
     self.lane_changes = LaneChangeFeature(params, authority, vehicle_fingerprint, self.vehicle_params,
                                           configuration_longitudinal=self.configuration_longitudinal)
     self.conditional = ConditionalFeature(self)
-    self.wheel = WheelFeature(self)
+    self.wheel = TeslaWheelRows(self)
 
   def _source_capability(self) -> tuple[bool, bool]:
     return bool(self.vision_development()), bool(self.maps_available())
@@ -1191,7 +1191,7 @@ class FeatureSettingsOwner:
       title = "Wheel Controls"
       if self.show_cruise_intervals or toyota_cruise_capability(self.vehicle_params()) is not None:
         rows.extend(self._cruise_rows(configurable))
-      rows.extend(self.wheel.rows())
+      rows = self.wheel.page(rows)
     elif page == FeaturePage.SLC:
       cp = self.vehicle_params()
       button_cruise = hyundai_software_cruise.slc_configurable(cp, self.params)

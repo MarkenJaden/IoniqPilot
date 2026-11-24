@@ -561,6 +561,44 @@ const ready = { actionDisabled: false, draftBranch: "Dom", operations: { canInst
 assert.equal(SoftwarePage.computed.canUpdate.call(ready), true)
 SoftwarePage.methods.askUpdate.call(ready)
 assert.equal(ready.installed, true)
+// Browsing Stable does not retarget an already-downloaded Testing update.
+const returnToStable = page('stable', ['stable', 'testing'], 'testing')
+returnToStable.draftBranch = 'stable'
+returnToStable.data.updater = { ...updater, targetBranch: 'testing', targetChangeFound: false, finalizedUpdateReady: true }
+returnToStable.operations = { ...returnToStable.operations, canInstall: false, canFastUpdate: true }
+Object.defineProperty(returnToStable, 'branchChanging', { get: () => SoftwarePage.computed.branchChanging.call(returnToStable) })
+assert.equal(returnToStable.branchChanging, true)
+assert.equal(SoftwarePage.computed.canUpdate.call(returnToStable), true)
+SoftwarePage.methods.askUpdate.call(returnToStable)
+assert.equal(returnToStable.dialog.action, 'update')
+assert.equal(returnToStable.dialog.branch, 'stable')
+assert.equal(returnToStable.dialog.label, 'Switch & restart')
+returnToStable.data.updater.finalizedUpdateReady = false
+assert.equal(SoftwarePage.computed.updateAvailable.call(returnToStable), false)
+assert.equal(returnToStable.branchChanging, true, 'a different branch can be installed even if there are no updates on the current branch')
+assert.equal(SoftwarePage.computed.canUpdate.call(returnToStable), true)
+
+const manualRestart = { dialog: null, actionDisabled: false, restartState: "", restartError: "",
+  restartDevice: SoftwarePage.methods.restartDevice }
+const originalFetch = globalThis.fetch
+const restartRequests = []
+try {
+  globalThis.fetch = async (url, options) => {
+    restartRequests.push([url, JSON.parse(options.body)])
+    return response({ restartRequested: true })
+  }
+  SoftwarePage.methods.askRestart.call(manualRestart)
+  assert.match(manualRestart.dialog.message, /update.*may install/)
+  SoftwarePage.methods.closeDialog.call(manualRestart)
+  assert.deepEqual(restartRequests, [])
+  SoftwarePage.methods.askRestart.call(manualRestart)
+  await SoftwarePage.methods.confirmDialog.call(manualRestart)
+  assert.deepEqual(restartRequests, [["./api/software/action", { action: "restart", confirmed: true }]])
+  assert.equal(manualRestart.restartState, "requested")
+} finally {
+  globalThis.fetch = originalFetch
+}
+
 const automatic = fixture()
 automatic.feed.start()
 await automatic.reply(0, snapshot({ operations: { ...operations, canFastUpdate: true } }))

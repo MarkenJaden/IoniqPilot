@@ -6,6 +6,7 @@ import threading
 import uuid
 from copy import copy
 from dataclasses import replace
+from typing import cast
 
 import openpilot.cereal.messaging as messaging
 
@@ -1311,7 +1312,7 @@ class SelfdriveD:
       self.AM.alerts.pop('aolAvailability/warning', None)
     if self.aol_axis_decision.aol_speed_paused and ET.WARNING not in self.state_machine.current_alert_types:
       # Preserve the existing speed warning duration even when only AOL was on.
-      speed_alert = copy(self.events.event_rules[EventName.speedTooHigh][ET.WARNING])
+      speed_alert = copy(cast(Alert, self.events.event_rules[EventName.speedTooHigh][ET.WARNING]))
       speed_alert.alert_type = 'speedTooHigh/warning'
       speed_alert.event_type = 'aolSpeedPause'
       alerts.append(speed_alert)
@@ -2346,9 +2347,11 @@ class SelfdriveD:
         self.ordinary_native_long_withdrawal(
           CS, native, previous, requested, intent, source_current=source_current, now_ns=now_ns))
       from openpilot.starpilot.car.hyundai.aol import expected_stopped_lateral_denial
+      from openpilot.starpilot.car.mazda.aol import expected_stopped_lateral_denial as mazda_stopped_denial
       stopped_lateral_withdrawal = bool(source_current and requested.desired_lateral and
-        expected_stopped_lateral_denial(self.CP, CS, native, sm=self.sm,
-          axis_session_id=self.aol_session_id, now_ns=now_ns))
+        (expected_stopped_lateral_denial(self.CP, CS, native, sm=self.sm,
+          axis_session_id=self.aol_session_id, now_ns=now_ns) or
+         mazda_stopped_denial(self.CP, CS, native, sm=self.sm, axis_session_id=self.aol_session_id, now_ns=now_ns)))
       lost_permission = bool(lost_honda_lateral_grant or native is not None and not driver_override and (
         previous.lateral_active and requested.desired_lateral and native.requestedLateral and
         not native.lateralAllowed and not stopped_lateral_withdrawal and

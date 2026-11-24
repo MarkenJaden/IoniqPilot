@@ -6,6 +6,7 @@ import { GxState } from "./state.js"
 import { GxNotice } from "./notice.js"
 import { GalaxySelect } from "./galaxy-select.js"
 import { GalaxySettingRow, switchRow } from "./galaxy-setting-row.js"
+import { requestJson } from "./startup.js"
 
 const ACTIONS = new Set(["check", "download", "select", "install", "preferences", "install-preferences", "update", "fast", "rollback", "versions", "version", "download-version"])
 const REQUEST_STATES = new Set(["pending", "complete", "failed"])
@@ -370,6 +371,7 @@ export const SoftwarePage = {
   props: { mode: { type: String, required: true }, unauthorized: { type: Function, required: true }, restarting: { type: Function, default: () => {} },
     preparing: { type: Function, default: () => {} }, cancelPreparation: { type: Function, default: () => {} } },
   data: () => ({ status: "idle", data: null, busy: false, uncertain: false, notice: "", error: "", submittingAction: null,
+    restartState: "", restartError: "",
     initialChecking: true, draftBranch: "", primaryChoice: "", draftTouched: false, dialog: null, newerVersionLimit: 2, olderVersionLimit: 1, collapsedOlderLimit: 0, version: "", restartCronFields: ["0", "0", "*", "*", "*"], scheduleTouched: false, restartTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone }),
   created() {
     this.feed = new SoftwareStatusFeed({ includeHistory: false, publish: (update) => {
@@ -422,11 +424,14 @@ export const SoftwarePage = {
       return null
     },
     updateAvailable() { return this.data?.updater.targetChangeFound === true || this.data?.updater?.finalizedUpdateReady === true },
+    branchChanging() {
+      return !!this.draftBranch && !!this.data?.installed.branch && this.draftBranch !== this.data.installed.branch
+    },
     osUpdateRequired() { return this.data?.updater.osUpdate?.required === true &&
       this.data.updater.osUpdate.branch === (this.draftBranch || this.operations?.selectedTarget) &&
       this.data.updater.osUpdate.branch === this.data.updater.targetBranch },
     canUpdate() {
-      if (this.data?.updater?.finalizedUpdateReady && this.draftBranch === this.operations?.selectedTarget) return this.operations.canInstall
+      if (this.operations?.canInstall && this.draftBranch === this.operations.selectedTarget) return true
       return this.operations?.canFastUpdate === true && this.branchOptions.some(branch => branch.name === this.draftBranch && branch.available)
     },
     updateBanner() {
@@ -454,7 +459,7 @@ export const SoftwarePage = {
     commitUrl() { return this.repositoryUrl && /^[0-9a-f]{7,40}$/.test(this.data?.installed.commit || "") ? `${this.repositoryUrl}/commit/${this.data.installed.commit}` : "" },
     pending() { return this.operations?.request?.state === "pending" },
     actionUnavailable() { return this.uncertain || this.pending || !!this.error || !this.operations?.parked },
-    actionDisabled() { return this.busy || this.actionUnavailable },
+    actionDisabled() { return this.busy || !!this.restartState || this.actionUnavailable },
     metadataActionDisabled() { return this.busy || this.uncertain || !!this.error || !this.operations?.parked },
     branchOptions() {
       const available = this.operations?.availableBranches || []
@@ -628,10 +633,11 @@ export const SoftwarePage = {
     askUpdate() {
       const branch = this.draftBranch || this.operations?.selectedTarget || this.data?.installed?.branch
       if (this.actionDisabled || !branch) return
-      if (this.data?.updater?.finalizedUpdateReady && branch === this.operations?.selectedTarget) return this.askInstall()
+      if (this.operations?.canInstall && branch === this.operations.selectedTarget) return this.askInstall()
       if (this.operations?.canFastUpdate !== true) return
-      this.dialog = { action: "update", branch, title: "Update software",
-        message: `Install the latest version of ${branch} and restart?`, label: "Update & restart" }
+      const switching = this.branchChanging
+      this.dialog = { action: "update", branch, title: switching ? "Switch software branch" : "Update software",
+        message: `Install the latest version of ${branch} and restart?`, label: switching ? "Switch & restart" : "Update & restart" }
     },
     loadHistory(event) {
       if (!event.target.open || this.operations?.history || this.busy) return
@@ -665,11 +671,34 @@ export const SoftwarePage = {
       this.dialog = { action: "install", branch: this.operations.selectedTarget, title: "Restart and install update",
         message: `Restart the device to install the finalized update for ${this.operations.selectedTarget}? Keep the vehicle parked and the device accessible.`, label: "Restart & install" }
     },
+    askRestart() {
+      if (this.actionDisabled) return
+      this.dialog = { action: "restart", title: "Restart device?",
+        message: "Galaxy will disconnect briefly. If an update is ready, it may install during the restart.", label: "Restart device" }
+    },
+    async restartDevice() {
+      if (this.actionDisabled) return
+      this.restartState = "sending"
+      this.restartError = ""
+      try {
+        const result = await requestJson("./api/software/action", {
+          request: { method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ action: "restart", confirmed: true }) },
+        })
+        if (result?.restartRequested !== true) throw new Error()
+        this.restartState = "requested"
+      } catch (error) {
+        this.restartState = ""
+        if (error.status === 401) this.unauthorized()
+        else this.restartError = error.status ? error.message : "Galaxy lost the connection. Check whether the device is restarting before trying again."
+      }
+    },
     closeDialog() { this.dialog = null },
     async confirmDialog() {
       const choice = this.dialog
       if (!choice) return
       this.dialog = null
+      if (choice.action === "restart") return this.restartDevice()
       const result = await this.feed.action(choice.action, choice.branch, choice)
       if (result && choice.action === "select") {
         this.draftTouched = false
@@ -702,7 +731,7 @@ export const SoftwarePage = {
           </div>
           <div v-if="!initialChecking && !updateProgress" class="gx-actions">
             <button type="button" class="gx-btn gx-btn--tonal" :disabled="metadataActionDisabled || !operations?.canCheck" @click="feed.action('check')">Check for updates</button>
-            <button v-if="updateAvailable || branchChanging" type="button" class="gx-btn" :disabled="actionDisabled || !canUpdate" @click="askUpdate">Update</button>
+            <button v-if="updateAvailable || branchChanging" type="button" class="gx-btn" :disabled="actionDisabled || !canUpdate" @click="askUpdate">{{ branchChanging ? 'Switch to ' + branchLabel(draftBranch) : 'Update' }}</button>
           </div>
           <div v-if="backgroundProgress" class="gx-update-progress" role="status" aria-live="polite">
             <div class="gx-update-progress__heading"><span>Background download · {{ backgroundProgress.label }}</span><span v-if="backgroundProgress.percent !== null">{{ Math.round(backgroundProgress.percent) }}%</span></div>
@@ -798,6 +827,14 @@ export const SoftwarePage = {
               <button type="submit" class="gx-btn gx-btn--tonal" :disabled="busy || uncertain || !operations.canConfigure || !restartScheduleChanged">Save restart schedule</button>
             </form>
           </div></details>
+        </section>
+        <section class="gx-card gx-panel gx-stack">
+          <h3>Device actions</h3>
+          <div class="gx-actions">
+            <button type="button" class="gx-btn gx-btn--tonal" :disabled="actionDisabled" @click="askRestart"><i class="bi bi-arrow-clockwise" aria-hidden="true"></i> Restart device</button>
+          </div>
+          <GxNotice v-if="restartState === 'requested'" tone="info">Restart requested. Galaxy will reconnect when the device is back online.</GxNotice>
+          <GxNotice v-if="restartError" tone="danger">{{ restartError }}</GxNotice>
         </section>
         <SystemMaintenance :unauthorized="unauthorized" />
         <GxDialog v-if="dialog" labelledby="gx-software-status-confirm-title" @close="closeDialog"><h3 id="gx-software-status-confirm-title">{{ dialog.title }}</h3><p>{{ dialog.message }}</p>

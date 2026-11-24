@@ -128,7 +128,6 @@
   "SteerLatAccel",
   "StockConfidenceBallWidget",
   "TeslaAOLDisengageOnBrake",
-  "TeslaAOLScreenTap",
   "TeslaWakeOnCAN",
   "ToyotaAutoHold",
   "TrafficFollow",
@@ -442,5 +441,7 @@
   "wheel:VeryLongCancelButtonControl",
   "wheel:VeryLongDistanceButtonControl",
   "wheel:VeryLongModeButtonControl",
-  "wheel:VeryLongStarButtonControl"
+  "wheel:VeryLongStarButtonControl",
+  "CoastDownhills",
+  "DownhillSpeedSurplus"
 ]

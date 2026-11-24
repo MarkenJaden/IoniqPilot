@@ -6,7 +6,7 @@ from unittest.mock import patch
 import pytest
 from opendbc.can import CANParser
 from opendbc.car import Bus, gen_empty_fingerprint, structs
-from opendbc.car.subaru.values import CAR, DBC
+from opendbc.car.subaru.values import CAR, DBC, FROGGER_ANGLE_SIBLINGS
 from opendbc.car.subaru.fingerprints import FW_VERSIONS
 from opendbc.safety.tests.libsafety import libsafety_py
 from openpilot.cereal import log, messaging
@@ -25,7 +25,7 @@ from openpilot.starpilot.car.subaru.tests.native_fixture import subaru_native_pa
                                        CAR.SUBARU_FORESTER, CAR.SUBARU_OUTBACK])
 def test_actual_full_engage_brake_reverse_temporary_recovery_mainoff(candidate, subaru_native_pair, tmp_path, aol=True, manual=False, stop_resume=False,
                                                                       hard_stop_native_first=False, main_only=False, preferences=None, firmware=None,
-                                                                      manual_ratio=None,
+                                                                      manual_ratio=None, camera_hud=False, manual_phase=0,
                                                                       deadline_gap=False, fixed_angle_handoff=False, host_first_stop=False,
                                                                       source_outage=False, vm_angle_handoff=0, crawl=False, eps_brake_join=False,
                                                                       high_angle_guard=False, main_on_brake=False, guard_brake_release=False,
@@ -38,7 +38,10 @@ def test_actual_full_engage_brake_reverse_temporary_recovery_mainoff(candidate, 
   if candidate == CAR.SUBARU_IMPREZA_2025 and firmware is None:
     from opendbc.car.subaru.tests.test_supported_firmware import recorded_impreza_firmware
     fw = recorded_impreza_firmware()
-  with actual_factory(candidate, gen_empty_fingerprint(), fw, '0' * 17, manual=manual, aol=aol, preferences=preferences) as (card, params, matches):
+  fingerprint = gen_empty_fingerprint()
+  if camera_hud:
+    fingerprint[2][0x3C4] = 8
+  with actual_factory(candidate, fingerprint, fw, '0' * 17, manual=manual, aol=aol, preferences=preferences) as (card, params, matches):
     cp = card.CP
     ci = card.CI
     safety = libsafety_py.libsafety
@@ -79,8 +82,9 @@ def test_actual_full_engage_brake_reverse_temporary_recovery_mainoff(candidate, 
       ticks = (list(range(30)) + list(range(30, 50)) * 16 + list(range(50, 460))
                if main_during_eps else list(range(125)) + list(range(125, 135)) * 30 + list(range(135, 460))
                if hard_stop_native_first or stop_creep_eps else list(range(70)) + list(range(70, 90)) * 16 + list(range(90, 460))
-               if angle_continuation else list(range(150)) + list(range(150, 185)) * 16 + list(range(185, 460))
-               if manual_ratio == 137 else range(460))
+               if angle_continuation else list(range(151)) + list(range(151, 185)) * 54 + list(range(185, 460))
+               if manual_phase == 1 else list(range(150)) + list(range(150, 185)) * 16 + list(range(185, 460))
+               if manual_ratio == 137 and not manual_phase else range(460))
       gap_tick = 75 if main_only else 210
       last_card_published = {}
       pending_host_can = []
@@ -100,7 +104,7 @@ def test_actual_full_engage_brake_reverse_temporary_recovery_mainoff(candidate, 
         brake = bool(brake or angle_continuation and 70 <= tick < 90)
         if eps_clear_join and 90 <= tick < 145:
           brake = eps_clear_join in (5, 6) and 95 <= tick < 102
-        reverse = 150 <= tick < 185
+        reverse = 150 + manual_phase <= tick < 185
         gear = manual_ratio if reverse and manual_ratio is not None else 3 if reverse else 121
         temporary = not guard_brake_release and 225 <= tick < 260
         main = not 310 <= tick < 350 and (tick >= 30 or not main_only)
@@ -160,8 +164,13 @@ def test_actual_full_engage_brake_reverse_temporary_recovery_mainoff(candidate, 
           if 225 <= tick < 260:
             values['Steering_Torque'].update(Steering_Angle=100, Steer_Torque_Sensor=94)
             values['Wheel_Speeds'] = dict.fromkeys(('FL', 'FR', 'RL', 'RR'), 8)
+        if vm_angle_handoff and tick >= 90:
+          values['Steering_2']['Steering_Angle'] = ci.CC.apply_angle_last
         if angle_continuation:
-          values['Steering_2']['Steering_Angle'] = ci.CC.apply_angle_last if tick < 90 else 0
+          angle = ci.CC.apply_angle_last
+          if reverse:
+            angle -= min(abs(angle), 3.) * (1 if angle > 0 else -1)
+          values['Steering_2']['Steering_Angle'] = angle
           values['Wheel_Speeds'] = dict.fromkeys(('FL', 'FR', 'RL', 'RR'), 17.28)
         if paused_eps:
           values['Dashlights'] = {'LEFT_BLINKER': int(90 <= tick < 115)}
@@ -193,6 +202,8 @@ def test_actual_full_engage_brake_reverse_temporary_recovery_mainoff(candidate, 
             values['Brake_Pressure_L_R'] = {'Steering_Angle': 101 if 125 <= tick < 148 else 0}
           else:
             values['Steering_Torque']['Steer_Warning'] = int(137 <= tick < 148 or temporary)
+        if camera_hud and candidate in FROGGER_ANGLE_SIBLINGS:
+          values['ES_LKAS_Alert'] = {'LKAS_Alert': 25, 'LKAS_HUD_Lights': 0}
         incoming = stream.frames(values, tick=tick)
         if source_outage:
           pending_host_can.append((now, incoming))
@@ -201,7 +212,8 @@ def test_actual_full_engage_brake_reverse_temporary_recovery_mainoff(candidate, 
           safety.safety_rx_hook(libsafety_py.make_CANPacket(addr, bus, data))
         safety.safety_tick()
         hard_stop_receipt = (hard_stop_native_first or host_first_stop) and elapsed == 125
-        if hard_stop_receipt:
+        paddle_native_receipt = bool(manual_phase and elapsed == 150 + manual_phase)
+        if hard_stop_receipt or paddle_native_receipt:
           # Native zero wheels and its USB poll precede the host's stopped CarState.
           receipt, hard_order = pandad.step(driven, published, now)
           assert hard_order['before'][:2] == (1, 0), hard_order
@@ -238,7 +250,8 @@ def test_actual_full_engage_brake_reverse_temporary_recovery_mainoff(candidate, 
             pending_eps_event = driven_new[service]
           else:
             peers.append(driven_new[service])
-        if receipt is not None and (tick % 10 == 1 or hard_stop_receipt and not host_first_stop or host_first_stop and elapsed == 127):
+        if receipt is not None and (tick % 10 == 1 or paddle_native_receipt or
+                                    hard_stop_receipt and not host_first_stop or host_first_stop and elapsed == 127):
           peers.append(receipt.as_reader())
         if paused_eps in (5, 6):
           # SubMaster delivers the latest publication per service after conflation.
@@ -284,7 +297,7 @@ def test_actual_full_engage_brake_reverse_temporary_recovery_mainoff(candidate, 
         if hard_stop_receipt and not host_first_stop:
           _assert_hard_stop_fault_guards(card, cs, now + 2000)
         # Deliver each genuine10Hz native receipt once; do not refresh receive time/frequency from a cached snapshot.
-        new_native = receipt if receipt is not None and (tick % 10 == 1 or hard_stop_receipt) else None
+        new_native = receipt if receipt is not None and (tick % 10 == 1 or hard_stop_receipt or paddle_native_receipt) else None
         if deadline_gap and elapsed == gap_tick:
           prior = driven['aolAxisState'].aolAxisState
           assert prior.lateralActive and now + 2000 > prior.validUntilMonoTime
@@ -335,19 +348,33 @@ def test_actual_full_engage_brake_reverse_temporary_recovery_mainoff(candidate, 
         outgoing = can_capnp_to_list([published['sendcan'].as_builder().to_bytes()], msgtype='sendcan')[0][1] if 'sendcan' in published else []
         tx = [(a, d.hex(), b, bool(safety.safety_tx_hook(libsafety_py.make_CANPacket(a, b, d)))) for a, d, b in outgoing]
         decoder.update([(now, outgoing)])
+        if camera_hud and candidate in FROGGER_ANGLE_SIBLINGS:
+          for address, data, bus, accepted in tx:
+            if address == 0x3C4:
+              assert bus == 0 and accepted, (candidate, tick, tx)
+              stock_chime = bytes((25, 0, 0))
+              suppress = ci.CS.out.cruiseState.available and ci.CC.angle_was_active and card.sm['carControl'].latActive
+              expected_alert = bytes(3) if suppress else stock_chime
+              assert bytes.fromhex(data)[2:5] == expected_alert, (candidate, tick, data)
+        assert not (candidate in FROGGER_ANGLE_SIBLINGS and any(frame[0] == 0x390 for frame in tx))
         dash_decoder.update([(now, outgoing)])
         if any(address == 0x322 for address, _, _ in outgoing):
           dash = dash_decoder.vl['ES_LKAS_State']
           expected = ci.CC.angle_was_active if steering_name == 'ES_LKAS_ANGLE' else card.sm['carControl'].latActive
-          if candidate == 'SUBARU_LEGACY_2025':
+          if candidate in FROGGER_ANGLE_SIBLINGS | {CAR.SUBARU_LEGACY_2025}:
             assert bool(dash['LKAS_ACTIVE']), (candidate, tick, expected, dash)
+            dash_green = ci.CC.aol_dash_green_last if candidate == CAR.SUBARU_LEGACY_2025 else expected
             if not cs.cruiseState.available or cs.steerFaultTemporary or cs.steerFaultPermanent:
               assert not ci.CC.aol_dash_green_last, (candidate, tick, dash)
             if expected:
-              assert ci.CC.aol_dash_green_last, (candidate, tick, dash)
+              assert dash_green, (candidate, tick, dash)
             ready_wheel = cs.cruiseState.available and bool(getattr(ci.CS, 'aol_enabled', True))
-            expected_dash = 2 if ci.CC.aol_dash_green_last else (1 if ready_wheel else 0)
+            if candidate in FROGGER_ANGLE_SIBLINGS:
+              ready_wheel = ready_wheel and aol
+            expected_dash = 2 if dash_green else (1 if ready_wheel else 0)
             assert dash['LKAS_Dash_State'] == expected_dash, (candidate, tick, expected, expected_dash, dash)
+            if camera_hud and expected and candidate in FROGGER_ANGLE_SIBLINGS:
+              assert dash['LKAS_Left_Line_Visible'] and dash['LKAS_Right_Line_Visible'], (candidate, tick, dash)
           else:
             assert bool(dash['LKAS_ACTIVE']) == expected, (candidate, tick, expected, dash)
             assert dash['LKAS_Dash_State'] == (2 if expected else 0), (candidate, tick, expected, dash)
@@ -375,7 +402,7 @@ def test_actual_full_engage_brake_reverse_temporary_recovery_mainoff(candidate, 
               if output != 0:
                 active_emissions.append(tick)
             if 165 <= tick < 180 or 240 <= tick < 255 or not aol and (125 <= tick < 145 or 205 <= tick < 220 or 280 <= tick < 300):
-              if angle_handoff:
+              if angle_handoff or angle_continuation:
                 assert not request and abs(output - cs.steeringAngleDeg) <= 0.011, (tick, decoded_steering)
               else:
                 assert not request and output == 0, (tick, decoded_steering)
@@ -455,9 +482,10 @@ def test_actual_full_engage_brake_reverse_temporary_recovery_mainoff(candidate, 
           assert command.latActive and bool(intent and intent.allowedLatch) == aol and row['permission'] == int(aol), row
         if not stopped and (first_resume or 205 <= tick < 220 or 280 <= tick < 300):
           assert command.latActive == aol and bool(intent and intent.allowedLatch) == aol and row['permission'] == int(aol) and not row['controls'], row
-        if manual_ratio is not None and 150 <= tick < 185:
+        if manual_ratio is not None and 150 + manual_phase <= tick < 185:
           assert not command.latActive and row['permission'] == 0 and row['cardLatch'] and row['armed'], row
-          assert all(not steering['request'] for steering in row['steering']), row
+          assert all(not steering['request'] or tick == 150 + manual_phase and not steering['nativeAccepted']
+                     for steering in row['steering']), row
         if 165 <= tick < 180:
           assert (not command.latActive and not bool(intent and intent.allowedLatch) and
                 bool(intent and intent.lateralArmed) == aol and row['cardLatch'] == aol and row['permission'] == 0), row
@@ -793,3 +821,10 @@ def test_actual_stopped_brake_release_source_gap_keeps_armed_intent(subaru_nativ
 def test_actual_crosstrek_manual_ratio_pauses_and_recovers(subaru_native_pair, tmp_path, ratio):
   test_actual_full_engage_brake_reverse_temporary_recovery_mainoff(
     CAR.SUBARU_IMPREZA_2020, subaru_native_pair, tmp_path, main_only=True, manual_ratio=ratio)
+
+
+@pytest.mark.parametrize("phase", (1, 4, 7))
+def test_actual_crosstrek_native_first_paddle_pause(subaru_native_pair, tmp_path, phase):
+  test_actual_full_engage_brake_reverse_temporary_recovery_mainoff(
+    CAR.SUBARU_IMPREZA_2020, subaru_native_pair, tmp_path, main_only=True, manual_ratio=145, manual_phase=phase,
+    preferences={'SubaruSNG': True})
